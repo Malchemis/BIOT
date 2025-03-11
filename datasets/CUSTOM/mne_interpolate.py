@@ -29,7 +29,7 @@ def interpolate_missing_channels(raw: RawCTF, good_channels: list, loc_meg_chann
 	new_raw.reorder_channels(good_channels)
 	new_raw.info['bads'] = missing_channels # set the bad channels to the missing channels for interpolate_bads to work
 
-	new_raw.interpolate_bads(origin=(0, 0, 0.04),reset_bads=True, verbose=False)
+	new_raw.interpolate_bads(origin=(0, 0, 0.04), reset_bads=True)
 	return new_raw
 
 
@@ -45,7 +45,7 @@ if __name__ == "__main__":
 	with open('/home/malchemis/PycharmProjects/BIOT/datasets/CUSTOM/loc_meg_channels.pkl', 'rb') as fp:
 		loc_meg_channels = pickle.load(fp)
 
-	raw = mne.io.read_raw_ctf(raw_file, preload=True, verbose=False) # reads the .ds
+	raw = mne.io.read_raw_ctf(raw_file, preload=True) # reads the .ds
 	raw.pick('meg') # picks only MEG sensors
 
 	# raw.plot() # plots the data
