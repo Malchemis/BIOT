@@ -116,20 +116,31 @@ class BIOTEncoder(nn.Module):
         """
         emb_seq = []
         for i in range(x.shape[1]):
+            # Spectrogram/Segment embedding
+            # Get the channel spectrogram (i to i+1 means only one channel):
+            # The shape goes from (batch_size, channels, ts) to (batch_size, freq, time steps) of the i_th channel
             channel_spec_emb = self.stft(x[:, i : i + 1, :])
+            # Spec to emb with a dense layer: the shape goes from (batch_size, freq, ts) to (batch_size, ts, emb)
             channel_spec_emb = self.patch_embedding(channel_spec_emb)
             batch_size, ts, _ = channel_spec_emb.shape
-            # (batch_size, ts, emb)
-            channel_token_emb = (
-                self.channel_tokens(self.index[i + n_channel_offset])
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .repeat(batch_size, ts, 1)
-            )
-            # (batch_size, ts, emb)
-            channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb)
 
-            # perturb
+            # Channel token embedding
+            # This adds channel-specific information to the embeddings
+            channel_token_emb = (
+                # Retrieve the learned embedding for the channel index
+                self.channel_tokens( # -> get the channel index (depends on the dataset's number of channels - 16 for CHB-MIT, 18 for TUAB)
+                    self.index[i + n_channel_offset] # hence the channel offset
+                ) # channel_tokens are of shape (n_channels, emb) so this returns the embedding for the i-th channel
+                .unsqueeze(0) # from shape (emb) to (1, emb)
+                .unsqueeze(0) # from shape (1, emb) to (1, 1, emb)
+                .repeat(batch_size, ts, 1) # to match dimensions, we repeat the channel embedding for all related segments
+            )
+
+            # Positional encoding
+            # (batch_size, ts, emb)
+            channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb) # Segment embeddings + Channel embeddings + Positional encoding
+
+            # perturb (create random mask)
             if perturb:
                 ts = channel_emb.shape[1]
                 ts_new = np.random.randint(ts // 2, ts)
@@ -138,9 +149,9 @@ class BIOTEncoder(nn.Module):
             emb_seq.append(channel_emb)
 
         # (batch_size, 16 * ts, emb)
-        emb = torch.cat(emb_seq, dim=1)
+        emb = torch.cat(emb_seq, dim=1) # concatenate all channel embeddings
         # (batch_size, emb)
-        emb = self.transformer(emb).mean(dim=1)
+        emb = self.transformer(emb).mean(dim=1) # mean pooling after transformer
         return emb
 
 

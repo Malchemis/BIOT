@@ -5,6 +5,8 @@ from multiprocessing import Pool
 import numpy as np
 import mne
 
+# Bipolar montage, this is why we need to subtract the signals
+
 # we need these channels
 # (signals[signal_names['EEG FP1-REF']] - signals[signal_names['EEG F7-REF']],  # 0
 # (signals[signal_names['EEG F7-REF']] - signals[signal_names['EEG T3-REF']]),  # 1
@@ -47,6 +49,12 @@ standard_channels = [
 
 
 def split_and_dump(params):
+    """
+    Load data, resample it, and split it into 2000 samples. Then dump them into pickle files.
+
+    Args:
+        params: list, [fetch_folder, sub, dump_folder, label]
+    """
     fetch_folder, sub, dump_folder, label = params
     for file in os.listdir(fetch_folder):
         if sub in file:
@@ -133,7 +141,7 @@ def split_and_dump(params):
                 pickle.dump(
                     {"X": channeled_data[:, i * 2000 : (i + 1) * 2000], "y": label},
                     open(dump_path, "wb"),
-                )
+                ) # segments of 2000 samples with no overlap
 
 
 if __name__ == "__main__":

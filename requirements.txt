@@ -1,6 +1,13 @@
-torch
-numpy
+torch~=2.6.0
+numpy~=1.26.4
 linear_attention_transformer
-einops
+einops~=0.8.1
 pytorch_lightning
-tqdm
+tqdm~=4.67.1
+mne[hdf5]~=1.8.0
+
+matplotlib~=3.9.4
+pandas~=1.5.3
+scipy~=1.13.1
+pytorch-lightning~=2.5.0.post0
+pyhealth~=1.1.6

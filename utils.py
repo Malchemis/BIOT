@@ -1,12 +1,38 @@
+from pathlib import Path
+
 import pickle
 import torch
 import numpy as np
-import torch.nn.functional as F
 import os
 from scipy.signal import resample
-from scipy.signal import butter, iirnotch, filtfilt
-from scipy.interpolate import interp1d
-from scipy.signal import butter, lfilter
+
+
+class MEGDataset(torch.utils.data.Dataset):
+    """PyTorch Dataset for loading preprocessed MEG data."""
+
+    def __init__(self, root, files):
+        """
+        Initialize the MEG dataset.
+
+        Parameters:
+        -----------
+        root : str
+            Root directory containing the processed data.
+        files : list
+            List of filenames to use.
+        """
+        self.root = root
+        self.files = files
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        # MEG data of shape (n_channels, sample_length)
+        file_path = Path(self.root, self.files[idx])
+        sample = torch.load(file_path)
+        return sample['data'], sample['label']
+
 
 
 class TUABLoader(torch.utils.data.Dataset):

@@ -22,7 +22,7 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
+from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
 
 
 class LitModel_finetune(pl.LightningModule):
@@ -47,7 +47,7 @@ class LitModel_finetune(pl.LightningModule):
             step_gt = y.cpu().numpy()
         return step_result, step_gt
 
-    def validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_end(self, val_step_outputs):
         result = np.array([])
         gt = np.array([])
         for out in val_step_outputs:
@@ -85,7 +85,7 @@ class LitModel_finetune(pl.LightningModule):
             step_gt = y.cpu().numpy()
         return step_result, step_gt
 
-    def test_epoch_end(self, test_step_outputs):
+    def on_test_epoch_end(self, test_step_outputs):
         result = np.array([])
         gt = np.array([])
         for out in test_step_outputs:
@@ -122,6 +122,54 @@ class LitModel_finetune(pl.LightningModule):
         )
 
         return [optimizer]  # , [scheduler]
+
+def prepare_custom_dataloader(args):
+    # set random seed
+    seed = 12345
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = "/home/malchemis/PycharmProjects/bio-sig-analysis/data/processed/crnl-meg"
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    np.random.shuffle(train_files)
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    # Only take a small subset to test the pipeline
+    train_files = train_files[:100]
+    val_files = val_files[:100]
+    test_files = test_files[:100]
+
+    # prepare training and test data loader
+    train_loader = torch.utils.data.DataLoader(
+        MEGDataset(os.path.join(root, "train"), train_files),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        MEGDataset(os.path.join(root, "test"), test_files),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        MEGDataset(os.path.join(root, "val"), val_files),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
 
 
 def prepare_TUAB_dataloader(args):
@@ -262,7 +310,7 @@ def prepare_PTB_dataloader(args):
 def supervised(args):
     # get data loaders
     if args.dataset == "TUAB":
-        train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
+        train_loader, test_loader, val_loader = prepare_custom_dataloader(args)
 
     else:
         raise NotImplementedError
@@ -350,9 +398,8 @@ def supervised(args):
 
     trainer = pl.Trainer(
         devices=[0],
-        accelerator="gpu",
+        accelerator="auto",
         strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,

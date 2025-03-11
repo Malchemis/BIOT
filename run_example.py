@@ -14,7 +14,7 @@ from model import (
 )
 
 # Sample data (batch_size, n_channels, sample_length)
-x = torch.randn(64, 16, 2000)
+x = torch.randn(12, 274, 100)
 
 """
 SPaRCNet - 1D CNN DenseNet
@@ -34,7 +34,7 @@ if model_name == "SPaRCNet":
     sparcnet = SPaRCNet(
         in_channels=16,
         sample_length=2000,
-        n_classes=5,
+        n_classes=1,
         block_layers=4,
         growth_rate=16,
         bn_size=16,
@@ -47,7 +47,7 @@ if model_name == "SPaRCNet":
 
 
 elif model_name == "ContraWR":
-    contrawr = ContraWR(in_channels=16, n_classes=5, fft=200, steps=20)
+    contrawr = ContraWR(in_channels=16, n_classes=1, fft=200, steps=20)
     out = contrawr(x)
     print(out.shape)
 
@@ -55,7 +55,7 @@ elif model_name == "ContraWR":
 elif model_name == "CNNTransformer":
     cnn_transformer = CNNTransformer(
         in_channels=16,
-        n_classes=5,
+        n_classes=1,
         fft=200,
         steps=20,
         dropout=0.2,
@@ -69,7 +69,7 @@ elif model_name == "CNNTransformer":
 elif model_name == "FFCL":
     ffcl = FFCL(
         in_channels=16,
-        n_classes=5,
+        n_classes=1,
         fft=200,
         steps=20,
         sample_length=2000,
@@ -80,16 +80,17 @@ elif model_name == "FFCL":
 
 
 elif model_name == "STTransformer":
-    st_transformer = STTransformer(emb_size=256, depth=4, n_classes=5)
+    st_transformer = STTransformer(emb_size=256, depth=4, n_classes=1)
     out = st_transformer(x)
     print(out.shape)
 
 
 elif model_name == "BIOT":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     biot_classifier = BIOTClassifier(
-        emb_size=256, heads=8, depth=4, n_classes=5, n_fft=200, hop_length=100
-    )
-    out = biot_classifier(x)
+        emb_size=256, heads=8, depth=4, n_classes=1, n_fft=20, hop_length=10, n_channels=274,
+    ).to(device)
+    out = biot_classifier(x.to(device)).cpu()
     print(out.shape)
 
 
@@ -99,7 +100,7 @@ elif model_name == "BIOT-pretrain-PREST":
         emb_size=256,
         heads=8,
         depth=4,
-        n_classes=5,
+        n_classes=1,
         n_fft=200,
         hop_length=100,
         n_channels=16,  # here is 16
@@ -115,7 +116,7 @@ elif model_name == "BIOT-pretrain-SHHS+PREST":
         emb_size=256,
         heads=8,
         depth=4,
-        n_classes=5,
+        n_classes=1,
         n_fft=200,
         hop_length=100,
         n_channels=18,  # here is 18
@@ -132,7 +133,7 @@ elif model_name == "BIOT-pretrain-six-datasets":
         emb_size=256,
         heads=8,
         depth=4,
-        n_classes=5,
+        n_classes=1,
         n_fft=200,
         hop_length=100,
         n_channels=18,  # here is 18
