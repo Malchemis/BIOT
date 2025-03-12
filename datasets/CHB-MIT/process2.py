@@ -134,7 +134,7 @@ def sub_to_segments(folder, out_folder):
                 min(seizure_time[1] + SAMPLING_RATE, signal.shape[1]),
                 5 * SAMPLING_RATE,
             ):
-                segment = signal[:, i : i + 10 * SAMPLING_RATE]
+                segment = signal[:, i : i + 10 * SAMPLING_RATE] # segments last 10 seconds
                 label = 1
                 # save the segment
                 pickle.dump(

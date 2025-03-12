@@ -5,34 +5,51 @@ import torch
 import numpy as np
 import os
 from scipy.signal import resample
+from typing import List, Tuple
 
 
 class MEGDataset(torch.utils.data.Dataset):
-    """PyTorch Dataset for loading preprocessed MEG data."""
+    """PyTorch Dataset for loading preprocessed MEG data.
 
-    def __init__(self, root, files):
-        """
-        Initialize the MEG dataset.
+    This dataset loads preprocessed MEG data from disk, stored as PyTorch tensors.
+    Each data sample contains the MEG signal and its associated label.
 
-        Parameters:
-        -----------
-        root : str
-            Root directory containing the processed data.
-        files : list
-            List of filenames to use.
+    Attributes:
+        root: Root directory containing the processed data.
+        files: List of filenames to use.
+    """
+
+    def __init__(self, root: str, files: List[str]):
+        """Initialize the MEG dataset.
+
+        Args:
+            root: Root directory containing the processed data.
+            files: List of filenames to use.
         """
         self.root = root
         self.files = files
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset.
+
+        Returns:
+            Number of samples in the dataset.
+        """
         return len(self.files)
 
-    def __getitem__(self, idx):
-        # MEG data of shape (n_channels, sample_length)
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a sample from the dataset.
+
+        Args:
+            idx: Index of the sample to retrieve.
+
+        Returns:
+            Tuple containing the MEG data and its label.
+        """
+        # Load MEG data of shape (n_channels, sample_length)
         file_path = Path(self.root, self.files[idx])
         sample = torch.load(file_path)
         return sample['data'], sample['label']
-
 
 
 class TUABLoader(torch.utils.data.Dataset):

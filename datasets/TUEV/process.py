@@ -10,27 +10,41 @@ https://github.com/Abhishaike/EEG_Event_Classification
 
 
 def BuildEvents(signals, times, EventData):
-    [numEvents, z] = EventData.shape  # numEvents is equal to # of rows of the .rec file
+    # numEvents is equal to the number of rows of the .rec file
+    [numEvents, z] = EventData.shape
+    # fs is the sampling frequency
     fs = 250.0
+    # numChan is the number of channels
     [numChan, numPoints] = signals.shape
-    # for i in range(numChan):  # standardize each channel
+
+    # standardize each channel
+    # for i in range(numChan):
     #     if np.std(signals[i, :]) > 0:
     #         signals[i, :] = (signals[i, :] - np.mean(signals[i, :])) / np.std(signals[i, :])
+
+    # features is a 3D array of shape (numEvents, numChan, fs * 5) for 5-second windows
     features = np.zeros([numEvents, numChan, int(fs) * 5])
-    offending_channel = np.zeros([numEvents, 1])  # channel that had the detected thing
+    # offending_channel is the channel that caused the event
+    offending_channel = np.zeros([numEvents, 1])
+    # As many labels as events
     labels = np.zeros([numEvents, 1])
-    offset = signals.shape[1]
+    # offset is the number of points in the signal
+    offset = numPoints
+    # Repeat the signals 3 times along the time axis to handle beginning and ending windows
     signals = np.concatenate([signals, signals, signals], axis=1)
-    for i in range(numEvents):  # for each event
-        chan = int(EventData[i, 0])  # chan is channel
-        start = np.where((times) >= EventData[i, 1])[0][0]
-        end = np.where((times) >= EventData[i, 2])[0][0]
+    # For each event
+    for i in range(numEvents):
+        # Get the channel id, start and end times
+        chan = int(EventData[i, 0])
+        start = np.where((times) >= EventData[i, 1])[0][0] # take the first timestamp which is greater than the event start time
+        end = np.where((times) >= EventData[i, 2])[0][0] # take the first timestamp which is greater than the event end time
         # print (offset + start - 2 * int(fs), offset + end + 2 * int(fs), signals.shape)
+        # Extract a 5-second window in the "middle" signal (the second one) for each channel
         features[i, :] = signals[
             :, offset + start - 2 * int(fs) : offset + end + 2 * int(fs)
         ]
         offending_channel[i, :] = int(chan)
-        labels[i, :] = int(EventData[i, 3])
+        labels[i, :] = int(EventData[i, 3]) # for this event, get
     return [features, offending_channel, labels]
 
 
@@ -41,6 +55,7 @@ def convert_signals(signals, Rawdata):
             Rawdata.info["ch_names"], list(range(len(Rawdata.info["ch_names"])))
         )
     }
+    # Creates a bipolar montage
     new_signals = np.vstack(
         (
             signals[signal_names["EEG FP1-REF"]]
@@ -101,18 +116,25 @@ def convert_signals(signals, Rawdata):
                 signals[signal_names["EEG C4-REF"]]
                 - signals[signal_names["EEG P4-REF"]]
             ),  # 20
-            (signals[signal_names["EEG P4-REF"]] - signals[signal_names["EEG O2-REF"]]),
+            (
+                signals[signal_names["EEG P4-REF"]]
+                - signals[signal_names["EEG O2-REF"]]
+            ),  # 21
         )
-    )  # 21
+    )
     return new_signals
 
 
 def readEDF(fileName):
+    # Read the EDF file
     Rawdata = mne.io.read_raw_edf(fileName)
+    # Extract the signals and the timestamps
     signals, times = Rawdata[:]
+    # Read the corresponding events
     RecFile = fileName[0:-3] + "rec"
     eventData = np.genfromtxt(RecFile, delimiter=",")
     Rawdata.close()
+    # Return the signals, the timestamps, the events and the raw data
     return [signals, times, eventData, Rawdata]
 
 
@@ -123,13 +145,17 @@ def load_up_objects(BaseDir, Features, OffendingChannels, Labels, OutDir):
             if fname[-4:] == ".edf":
                 print("\t%s" % fname)
                 try:
+                    # read
                     [signals, times, event, Rawdata] = readEDF(
                         dirName + "/" + fname
                     )  # event is the .rec file in the form of an array
+                    # bipolar montage
                     signals = convert_signals(signals, Rawdata)
                 except (ValueError, KeyError):
                     print("something funky happened in " + dirName + "/" + fname)
                     continue
+
+                # get the features (for each event and channel, we have a 5-second window), offending channels and labels
                 signals, offending_channels, labels = BuildEvents(signals, times, event)
 
                 for idx, (signal, offending_channel, label) in enumerate(

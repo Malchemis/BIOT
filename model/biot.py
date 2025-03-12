@@ -23,6 +23,39 @@ class PatchFrequencyEmbedding(nn.Module):
         return x
 
 
+class PatchTimeEmbedding(nn.Module):
+    def __init__(self, emb_size=256, patch_size=100, overlap=0.0):
+        super().__init__()
+        self.patch_size = patch_size
+        self.overlap = overlap
+        self.projection = nn.Linear(patch_size, emb_size)
+
+    def forward(self, x):
+        """
+        x: (batch, channel, time)
+        out: (batch, n_patches, emb_size)
+
+        With overlap, n_patches will be larger than time // patch_size
+        """
+        time_steps = x.shape[2]
+
+        # Calculate stride based on overlap
+        stride = int(self.patch_size * (1 - self.overlap))
+        stride = max(1, stride)  # Ensure stride is at least 1
+
+        # Ensure we have enough time steps for at least one patch
+        if time_steps < self.patch_size:
+            raise ValueError(f"Input length ({time_steps}) must be >= patch_size ({self.patch_size})")
+
+        # Use unfold with the calculated stride to create overlapping patches
+        x = x.squeeze(1)  # Remove channel dim: (batch, time)
+        x = x.unfold(1, self.patch_size, stride)  # (batch, n_patches, patch_size)
+
+        # Project to embedding dimension
+        x = self.projection(x)  # (batch, n_patches, emb_size)
+        return x
+
+
 class ClassificationHead(nn.Sequential):
     def __init__(self, emb_size, n_classes):
         super().__init__()
@@ -65,23 +98,34 @@ class PositionalEncoding(nn.Module):
 
 class BIOTEncoder(nn.Module):
     def __init__(
-        self,
-        emb_size=256,
-        heads=8,
-        depth=4,
-        n_channels=16,
-        n_fft=200,
-        hop_length=100,
-        **kwargs
+            self,
+            emb_size=256,
+            heads=8,
+            depth=4,
+            n_channels=16,
+            n_fft=200,
+            hop_length=100,
+            raw=False,      # Parameter to toggle between spectral and raw data
+            patch_size=100, # Patch size for raw data mode
+            overlap=0.0,    # Overlap between patches for raw data mode
+            **kwargs
     ):
         super().__init__()
 
         self.n_fft = n_fft
         self.hop_length = hop_length
+        self.raw = raw  # Store the raw mode flag
 
-        self.patch_embedding = PatchFrequencyEmbedding(
+        # Create both embedding modules
+        self.patch_frequency_embedding = PatchFrequencyEmbedding(
             emb_size=emb_size, n_freq=self.n_fft // 2 + 1
         )
+
+        # Add the new patch time embedding for raw data
+        self.patch_time_embedding = PatchTimeEmbedding(
+            emb_size=emb_size, patch_size=patch_size, overlap=overlap
+        )
+
         self.transformer = LinearAttentionTransformer(
             dim=emb_size,
             heads=heads,
@@ -99,46 +143,52 @@ class BIOTEncoder(nn.Module):
         )
 
     def stft(self, sample):
-        spectral = torch.stft( 
-            input = sample.squeeze(1),
-            n_fft = self.n_fft,
-            hop_length = self.hop_length,
-            center = False,
-            onesided = True,
-            return_complex = True,
+        spectral = torch.stft(
+            input=sample.squeeze(1),  # from shape (batch_size, 1, ts) to (batch_size, ts)
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            # window=torch.hann_window(self.n_fft).to(sample.device),
+            center=False,
+            onesided=True,
+            return_complex=True,
         )
         return torch.abs(spectral)
 
     def forward(self, x, n_channel_offset=0, perturb=False):
         """
-        x: [batch_size, channel, ts]
+        x: [batch_size, channel, ts] for example if sampling rate is 200,
+        and we take 10s windows we get 2000 time steps per channel and sample of a batch
         output: [batch_size, emb_size]
         """
         emb_seq = []
+        # For each channel
         for i in range(x.shape[1]):
-            # Spectrogram/Segment embedding
-            # Get the channel spectrogram (i to i+1 means only one channel):
-            # The shape goes from (batch_size, channels, ts) to (batch_size, freq, time steps) of the i_th channel
-            channel_spec_emb = self.stft(x[:, i : i + 1, :])
-            # Spec to emb with a dense layer: the shape goes from (batch_size, freq, ts) to (batch_size, ts, emb)
-            channel_spec_emb = self.patch_embedding(channel_spec_emb)
-            batch_size, ts, _ = channel_spec_emb.shape
+            # Get the current channel data
+            channel_data = x[:, i:i + 1, :]
 
-            # Channel token embedding
-            # This adds channel-specific information to the embeddings
+            # Segmentation (shape goes from (batch, 1, ts) to (batch, ts, emb_size))
+            if self.raw:
+                # Raw time-series data processing
+                channel_emb = self.patch_time_embedding(channel_data)
+            else:
+                # Spectral data processing
+                channel_spec = self.stft(channel_data) # shape: batch, freq, ts
+                channel_emb = self.patch_frequency_embedding(channel_spec)
+
+            batch_size, ts, _ = channel_emb.shape
+
+            # Channel token embedding: We get the channel embedding, make it match the segment shape, and apply.
             channel_token_emb = (
-                # Retrieve the learned embedding for the channel index
-                self.channel_tokens( # -> get the channel index (depends on the dataset's number of channels - 16 for CHB-MIT, 18 for TUAB)
-                    self.index[i + n_channel_offset] # hence the channel offset
-                ) # channel_tokens are of shape (n_channels, emb) so this returns the embedding for the i-th channel
-                .unsqueeze(0) # from shape (emb) to (1, emb)
-                .unsqueeze(0) # from shape (1, emb) to (1, 1, emb)
-                .repeat(batch_size, ts, 1) # to match dimensions, we repeat the channel embedding for all related segments
+                self.channel_tokens(
+                    self.index[i + n_channel_offset]
+                )
+                .unsqueeze(0) # shape from (emb) to (1, emb)
+                .unsqueeze(0) # (1, 1, emb)
+                .repeat(batch_size, ts, 1) # repeat the channel embedding for all corresponding segments
             )
 
-            # Positional encoding
-            # (batch_size, ts, emb)
-            channel_emb = self.positional_encoding(channel_spec_emb + channel_token_emb) # Segment embeddings + Channel embeddings + Positional encoding
+            # Positional encoding: We add segment and channel emb, then we apply relative positional emb.
+            channel_emb = self.positional_encoding(channel_emb + channel_token_emb)
 
             # perturb (create random mask)
             if perturb:
@@ -148,18 +198,18 @@ class BIOTEncoder(nn.Module):
                 channel_emb = channel_emb[:, selected_ts]
             emb_seq.append(channel_emb)
 
-        # (batch_size, 16 * ts, emb)
-        emb = torch.cat(emb_seq, dim=1) # concatenate all channel embeddings
+        # (batch_size, channels*ts, emb)
+        emb = torch.cat(emb_seq, dim=1)
         # (batch_size, emb)
-        emb = self.transformer(emb).mean(dim=1) # mean pooling after transformer
+        emb = self.transformer(emb).mean(dim=1)
         return emb
 
 
-# supervised classifier module
+# Modified to pass raw parameter to BIOTEncoder
 class BIOTClassifier(nn.Module):
-    def __init__(self, emb_size=256, heads=8, depth=4, n_classes=6, **kwargs):
+    def __init__(self, emb_size=256, heads=8, depth=4, n_classes=6, raw=False, overlap=0.0, **kwargs):
         super().__init__()
-        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, **kwargs)
+        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, raw=raw, overlap=overlap, **kwargs)
         self.classifier = ClassificationHead(emb_size, n_classes)
 
     def forward(self, x):
@@ -168,11 +218,11 @@ class BIOTClassifier(nn.Module):
         return x
 
 
-# unsupervised pre-train module
+# Modified to pass raw parameter to BIOTEncoder
 class UnsupervisedPretrain(nn.Module):
-    def __init__(self, emb_size=256, heads=8, depth=4, n_channels=18, **kwargs):
+    def __init__(self, emb_size=256, heads=8, depth=4, n_channels=18, raw=False, **kwargs):
         super(UnsupervisedPretrain, self).__init__()
-        self.biot = BIOTEncoder(emb_size, heads, depth, n_channels, **kwargs)
+        self.biot = BIOTEncoder(emb_size, heads, depth, n_channels, raw=raw, **kwargs)
         self.prediction = nn.Sequential(
             nn.Linear(256, 256),
             nn.GELU(),
@@ -186,11 +236,11 @@ class UnsupervisedPretrain(nn.Module):
         return emb, pred_emb
 
 
-# supervised pre-train module
+# Modified to pass raw parameter to BIOTEncoder
 class SupervisedPretrain(nn.Module):
-    def __init__(self, emb_size=256, heads=8, depth=4, **kwargs):
+    def __init__(self, emb_size=256, heads=8, depth=4, raw=False, **kwargs):
         super().__init__()
-        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth)
+        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, raw=raw, **kwargs)
         self.classifier_chb_mit = ClassificationHead(emb_size, 1)
         self.classifier_iiic_seizure = ClassificationHead(emb_size, 6)
         self.classifier_tuab = ClassificationHead(emb_size, 1)
@@ -213,10 +263,25 @@ class SupervisedPretrain(nn.Module):
 
 if __name__ == "__main__":
     x = torch.randn(16, 2, 2000)
-    model = BIOTClassifier(n_fft=200, hop_length=200, depth=4, heads=8)
-    out = model(x)
-    print(out.shape)
 
-    model = UnsupervisedPretrain(n_fft=200, hop_length=200, depth=4, heads=8)
-    out1, out2 = model(x)
-    print(out1.shape, out2.shape)
+    # Test with spectral processing
+    model = BIOTClassifier(n_fft=200, hop_length=100, depth=4, heads=8, raw=False)
+    out = model(x)
+    print("Spectral output shape:", out.shape)
+
+    # Test with raw data processing (no overlap)
+    model_raw = BIOTClassifier(n_fft=200, hop_length=100, depth=4, heads=8, raw=True, patch_size=100, overlap=0.0)
+    out_raw = model_raw(x)
+    print("Raw output shape (no overlap):", out_raw.shape)
+
+    # Test with raw data processing (50% overlap)
+    model_raw_overlap = BIOTClassifier(n_fft=200, hop_length=100, depth=4, heads=8, raw=True, patch_size=100,
+                                       overlap=0.5)
+    out_raw_overlap = model_raw_overlap(x)
+    print("Raw output shape (50% overlap):", out_raw_overlap.shape)
+
+    # Test unsupervised pretraining with raw data and overlap
+    model_unsup = UnsupervisedPretrain(n_fft=200, hop_length=100, depth=4, heads=8, raw=True, patch_size=100,
+                                       overlap=0.25)
+    out1, out2 = model_unsup(x)
+    print("Unsupervised raw output shapes:", out1.shape, out2.shape)

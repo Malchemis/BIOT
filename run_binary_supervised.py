@@ -1,11 +1,10 @@
+import random
+
 import os
 import argparse
-import pickle
 
 import torch
-from tqdm import tqdm
 import numpy as np
-import torch.nn as nn
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -22,20 +21,23 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
+from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss#, BCE
 
 
 class LitModel_finetune(pl.LightningModule):
-    def __init__(self, args, model):
+    def __init__(self, args: argparse.Namespace, model):
         super().__init__()
         self.model = model
         self.threshold = 0.5
         self.args = args
+        self.validation_step_outputs = []
+        self.test_step_outputs = []
 
     def training_step(self, batch, batch_idx):
         X, y = batch
         prob = self.model(X)
-        loss = BCE(prob, y)  # focal_loss(prob, y)
+        # loss = BCE(prob, y)
+        loss = focal_loss(prob, y)
         self.log("train_loss", loss)
         return loss
 
@@ -45,23 +47,29 @@ class LitModel_finetune(pl.LightningModule):
             prob = self.model(X)
             step_result = torch.sigmoid(prob).cpu().numpy()
             step_gt = y.cpu().numpy()
+        # Append the result to the list
+        self.validation_step_outputs.append((step_result, step_gt))
         return step_result, step_gt
 
-    def on_validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_start(self):
+        # Clear the list at the start of validation
+        self.validation_step_outputs = []
+
+    def on_validation_epoch_end(self):
+        # Process the outputs without parameters
+        val_step_outputs = self.validation_step_outputs
         result = np.array([])
         gt = np.array([])
         for out in val_step_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
 
-        if (
-            sum(gt) * (len(gt) - sum(gt)) != 0
-        ):  # to prevent all 0 or all 1 and raise the AUROC error
+        if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
             self.threshold = np.sort(result)[-int(np.sum(gt))]
             result = binary_metrics_fn(
                 gt,
                 result,
-                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"],
+                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
         else:
@@ -70,11 +78,14 @@ class LitModel_finetune(pl.LightningModule):
                 "balanced_accuracy": 0.0,
                 "pr_auc": 0.0,
                 "roc_auc": 0.0,
+                "f1": 0.0,
             }
         self.log("val_acc", result["accuracy"], sync_dist=True)
         self.log("val_bacc", result["balanced_accuracy"], sync_dist=True)
         self.log("val_pr_auc", result["pr_auc"], sync_dist=True)
         self.log("val_auroc", result["roc_auc"], sync_dist=True)
+        self.log("val_f1", result["f1"], sync_dist=True)
+        self.log("best_threshold", self.threshold, sync_dist=True)
         print(result)
 
     def test_step(self, batch, batch_idx):
@@ -83,21 +94,27 @@ class LitModel_finetune(pl.LightningModule):
             convScore = self.model(X)
             step_result = torch.sigmoid(convScore).cpu().numpy()
             step_gt = y.cpu().numpy()
+        # Append to the test outputs list
+        self.test_step_outputs.append((step_result, step_gt))
         return step_result, step_gt
 
-    def on_test_epoch_end(self, test_step_outputs):
+    def on_test_epoch_start(self):
+        # Clear the list at the start of testing
+        self.test_step_outputs = []
+
+    def on_test_epoch_end(self):
+        # Process the outputs without parameters
+        test_step_outputs = self.test_step_outputs
         result = np.array([])
         gt = np.array([])
         for out in test_step_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
-        if (
-            sum(gt) * (len(gt) - sum(gt)) != 0
-        ):  # to prevent all 0 or all 1 and raise the AUROC error
+        if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
             result = binary_metrics_fn(
                 gt,
                 result,
-                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"],
+                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
         else:
@@ -111,6 +128,7 @@ class LitModel_finetune(pl.LightningModule):
         self.log("test_bacc", result["balanced_accuracy"], sync_dist=True)
         self.log("test_pr_auc", result["pr_auc"], sync_dist=True)
         self.log("test_auroc", result["roc_auc"], sync_dist=True)
+        self.log("test_f1", result["f1"], sync_dist=True)
 
         return result
 
@@ -123,27 +141,31 @@ class LitModel_finetune(pl.LightningModule):
 
         return [optimizer]  # , [scheduler]
 
+def seed_worker(worker_id):
+    # Set seed for Python and NumPy in each worker
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 def prepare_custom_dataloader(args):
     # set random seed
     seed = 12345
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    root = "/home/malchemis/PycharmProjects/bio-sig-analysis/data/processed/crnl-meg"
+    root = "/home/malchemis/PycharmProjects/bio-sig-analysis/data/processed/crnl-meg-600Hz"
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
     val_files = os.listdir(os.path.join(root, "val"))
     test_files = os.listdir(os.path.join(root, "test"))
 
-    print(len(train_files), len(val_files), len(test_files))
-
-    # Only take a small subset to test the pipeline
-    train_files = train_files[:100]
-    val_files = val_files[:100]
-    test_files = test_files[:100]
+    print("Size of train, val, and test file list: ", len(train_files), len(val_files), len(test_files))
 
     # prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
@@ -153,6 +175,7 @@ def prepare_custom_dataloader(args):
         drop_last=True,
         num_workers=args.num_workers,
         persistent_workers=True,
+        worker_init_fn=seed_worker
     )
     test_loader = torch.utils.data.DataLoader(
         MEGDataset(os.path.join(root, "test"), test_files),
@@ -160,6 +183,7 @@ def prepare_custom_dataloader(args):
         shuffle=False,
         num_workers=args.num_workers,
         persistent_workers=True,
+        worker_init_fn=seed_worker
     )
     val_loader = torch.utils.data.DataLoader(
         MEGDataset(os.path.join(root, "val"), val_files),
@@ -167,8 +191,9 @@ def prepare_custom_dataloader(args):
         shuffle=False,
         num_workers=args.num_workers,
         persistent_workers=True,
+        worker_init_fn=seed_worker
     )
-    print(len(train_loader), len(val_loader), len(test_loader))
+    print("Size of train, val, and test loaders: ",len(train_loader), len(val_loader), len(test_loader))
     return train_loader, test_loader, val_loader
 
 
@@ -309,9 +334,8 @@ def prepare_PTB_dataloader(args):
 
 def supervised(args):
     # get data loaders
-    if args.dataset == "TUAB":
+    if args.dataset == "MEG":
         train_loader, test_loader, val_loader = prepare_custom_dataloader(args)
-
     else:
         raise NotImplementedError
 
@@ -374,6 +398,7 @@ def supervised(args):
             n_classes=args.n_classes,
             # set the n_channels according to the pretrained model if necessary
             n_channels=args.in_channels,
+            # if nfft 200 and hop length 100 -> 50% overlap
             n_fft=args.token_size,
             hop_length=args.hop_length,
         )
@@ -388,35 +413,99 @@ def supervised(args):
     # logger and callbacks
     version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
     logger = TensorBoardLogger(
-        save_dir="./",
+        save_dir="./log",
         version=version,
-        name="log",
+        name="",
     )
+
+    dirpath = logger.log_dir
+
+    # Early stopping to monitor PR AUC
     early_stop_callback = EarlyStopping(
-        monitor="val_auroc", patience=5, verbose=False, mode="max"
+        monitor="val_pr_auc", patience=10, verbose=True, mode="max"
+    )
+
+    # Save the best 3 models, and monitor PR AUC
+    best_checkpoint_callback = ModelCheckpoint(
+        dirpath=dirpath,
+        filename="best-{epoch:02d}-{val_pr_auc:.4f}",
+        save_top_k=3,
+        monitor="val_pr_auc",
+        mode="max",
+        save_last=False,
+        verbose=True
+    )
+
+    # Ensure the last model is being saved correctly
+    last_checkpoint_callback = ModelCheckpoint(
+        dirpath=dirpath,
+        filename="last-{epoch:02d}",
+        save_top_k=1,
+        save_last=True,
+        verbose=True
     )
 
     trainer = pl.Trainer(
         devices=[0],
         accelerator="auto",
-        strategy=DDPStrategy(find_unused_parameters=False),
+        strategy=DDPStrategy(find_unused_parameters=True),
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
         max_epochs=args.epochs,
-        callbacks=[early_stop_callback],
+        callbacks=[early_stop_callback, best_checkpoint_callback, last_checkpoint_callback],
     )
 
     # train the model
+    print("Starting model training...")
     trainer.fit(
         lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
     )
+    print("Training completed")
 
-    # test the model
-    pretrain_result = trainer.test(
-        model=lightning_model, ckpt_path="best", dataloaders=test_loader
-    )[0]
-    print(pretrain_result)
+    # Test with the best models
+    print("Testing with best models...")
+    if hasattr(best_checkpoint_callback, 'best_k_models') and best_checkpoint_callback.best_k_models:
+        # Sort models by score (higher PR AUC is better)
+        sorted_models = sorted(
+            [(score, path) for path, score in best_checkpoint_callback.best_k_models.items()],
+            reverse=True  # Higher score is better since we're using max mode
+        )
+
+        print(f"Found {len(sorted_models)} best models")
+        for i, (score, path) in enumerate(sorted_models):
+            print(f"Testing best model {i + 1}/{len(sorted_models)}: {path}")
+            result = trainer.test(
+                model=lightning_model, ckpt_path=path, dataloaders=test_loader
+            )[0]
+            print(f"Best model {i + 1} test results (PR AUC: {score.item():.4f}):")
+            print(result)
+    else:
+        print("No best model checkpoints found")
+
+    # Test with the last model
+    print("Testing with last model...")
+    last_model_path = os.path.join(dirpath, "last.ckpt")
+    if os.path.exists(last_model_path):
+        print(f"Found last model at: {last_model_path}")
+        last_result = trainer.test(
+            model=lightning_model, ckpt_path=last_model_path, dataloaders=test_loader
+        )[0]
+        print("Last model test results:")
+        print(last_result)
+    else:
+        # Fallback - look for the filename pattern if the default path doesn't exist
+        last_checkpoints = [f for f in os.listdir(dirpath) if f.startswith("last-epoch=")]
+        if last_checkpoints:
+            last_model_path = os.path.join(dirpath, last_checkpoints[0])
+            print(f"Found last model at alternative path: {last_model_path}")
+            last_result = trainer.test(
+                model=lightning_model, ckpt_path=last_model_path, dataloaders=test_loader
+            )[0]
+            print("Last model test results:")
+            print(last_result)
+        else:
+            print("No last model checkpoint found")
 
 
 if __name__ == "__main__":
@@ -454,7 +543,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrain_model_path", type=str, default="", help="pretrained model path"
     )
-    args = parser.parse_args()
-    print(args)
+    arguments = parser.parse_args()
+    print(arguments)
 
-    supervised(args)
+    supervised(arguments)
