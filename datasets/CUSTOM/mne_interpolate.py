@@ -34,8 +34,12 @@ def interpolate_missing_channels(raw: RawCTF, good_channels: list, loc_meg_chann
 
 
 if __name__ == "__main__":
+	# Handle a particular subject that has strange signal on some channels
+	strange_channels = ['MRO22-2805', 'MRO23-2805', 'MRO24-2805']
+
 	# path to .ds
-	raw_file='/home/malchemis/PycharmProjects/bio-sig-analysis/data/raw/crnl-meg/sample-data/p4S.ds'
+	from glob import glob
+	raw_filenames = glob('/home/malchemis/PycharmProjects/bio-sig-analysis/data/raw/crnl-meg/sample-data/Liogier_AllDataset1200Hz/*.ds')
 
 	# path to the file.pkl containing the list of good channels
 	with open('/home/malchemis/PycharmProjects/BIOT/datasets/CUSTOM/good_channels', 'rb') as fp:
@@ -45,11 +49,14 @@ if __name__ == "__main__":
 	with open('/home/malchemis/PycharmProjects/BIOT/datasets/CUSTOM/loc_meg_channels.pkl', 'rb') as fp:
 		loc_meg_channels = pickle.load(fp)
 
-	raw = mne.io.read_raw_ctf(raw_file, preload=True) # reads the .ds
-	raw.pick('meg') # picks only MEG sensors
+	# load the raw files
+	raw_files = [mne.io.read_raw_ctf(raw_filename, preload=True).pick('meg') for raw_filename in raw_filenames]
 
-	# raw.plot() # plots the data
-	interp_raw = interpolate_missing_channels(raw, good_channels, loc_meg_channels) # interpolates the missing channels
-	interp_raw.plot()
-	input("Press enter to continue")
+	# Drop the strange channels
+	for raw in raw_files:
+		raw.drop_channels(strange_channels)
 
+	# interpolate the missing channels
+	interp_raw = []
+	for raw in raw_files:
+		interp_raw.append(interpolate_missing_channels(raw, good_channels, loc_meg_channels))

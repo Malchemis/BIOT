@@ -435,6 +435,11 @@ class MEGPreprocessor:
         if interpolate:
             # Interpolate missing channels
             self.logger.debug("Interpolating missing channels")
+            # handle a particular subject that has strange signal on some channels
+            if 'Liogier_AllDataset1200Hz' in file_path:
+                self.logger.debug("Handling Liogier_AllDataset1200Hz")
+                strange_channels = ['MRO22-2805', 'MRO23-2805', 'MRO24-2805']
+                raw_file.drop_channels(strange_channels)
             raw_file = interpolate_missing_channels(raw_file, self.good_channels, self.loc_meg_channels)
         else:
             # Only keep the valid channels
