@@ -75,6 +75,9 @@ class MEGPreprocessor:
         clip_length_s: Length of each clip in seconds.
         overlap: Fraction of overlap between consecutive clips.
         sampling_rate: Target sampling rate in Hz.
+        l_freq: Lower frequency for bandpass filter.
+        h_freq: Higher frequency for bandpass filter.
+        notch_freq: Frequency for notch filter.
         train_ratio: Ratio of patients to use for training.
         val_ratio: Ratio of patients to use for validation.
         random_state: Random seed for reproducibility.
@@ -94,6 +97,9 @@ class MEGPreprocessor:
             clip_length_s: float = 1.0,
             overlap: float = 0.5,
             sampling_rate: int = 200,
+            l_freq: float = 1.0,
+            h_freq: float = 70.0,
+            notch_freq: float = 50.0,
             train_ratio: float = 0.7,
             val_ratio: float = 0.15,
             random_state: int = 42,
@@ -109,6 +115,9 @@ class MEGPreprocessor:
             clip_length_s: Length of each clip in seconds.
             overlap: Fraction of overlap between consecutive clips (0.0 to < 1.0).
             sampling_rate: Target sampling rate in Hz.
+            l_freq: Lower frequency for bandpass filter.
+            h_freq: Higher frequency for bandpass filter.
+            notch_freq: Frequency for notch filter.
             train_ratio: Ratio of patients to use for training.
             val_ratio: Ratio of patients to use for validation.
             random_state: Random seed for reproducibility.
@@ -122,6 +131,9 @@ class MEGPreprocessor:
         self.clip_length_s = clip_length_s
         self.overlap = overlap
         self.sampling_rate = sampling_rate
+        self.l_freq = l_freq
+        self.h_freq = h_freq
+        self.notch_freq = notch_freq
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.random_state = random_state
@@ -864,18 +876,18 @@ def main():
     parser.add_argument('--output_dir', type=str, help='Directory to save processed data')
     parser.add_argument('--good_channels_file_path', type=str, help='Path to the file containing the list of good channels')
     parser.add_argument('--loc_meg_channels_file_path', type=str, help='Path to the file containing the list of locations of meg channels')
-    parser.add_argument('--interpolate_miss_ch', action='store_true', help='Interpolate missing channels (if false, we drop the missing channels)')
+    parser.add_argument('--interpolate_miss_ch', type=bool, default=True, help='Interpolate missing channels (if false, we drop the missing channels)')
     parser.add_argument('--clip_length_s', type=float, default=1.0, help='Length of each clip in seconds')
     parser.add_argument('--overlap', type=float, default=0.0, help='Fraction of overlap between consecutive clips (0.0 to <1.0)')
     parser.add_argument('--sampling_rate', type=int, default=200, help='Target sampling rate in Hz')
     parser.add_argument('--l_freq', type=float, default=1.0, help='Low-pass filter frequency in Hz')
     parser.add_argument('--h_freq', type=float, default=70.0, help='High-pass filter frequency in Hz')
     parser.add_argument('--notch_freq', type=float, default=50.0, help='Notch filter frequency in Hz')
-    parser.add_argument('--train_ratio', type=float, default=0.5, help='Ratio of patients for training')
-    parser.add_argument('--val_ratio', type=float, default=0.25, help='Ratio of patients for validation')
+    parser.add_argument('--train_ratio', type=float, default=0.8, help='Ratio of patients for training')
+    parser.add_argument('--val_ratio', type=float, default=0.2, help='Ratio of patients for validation')
     parser.add_argument('--random_state', type=int, default=42, help='Random seed')
     parser.add_argument('--validate', type=str, default=None, help='Path to a specific .ds file to validate after processing')
-    parser.add_argument('--test', action='store_true', help='Test the datasets after processing')
+    parser.add_argument('--test', type=bool, default=False, help='Test the datasets after processing')
     parser.add_argument('--log_level', type=str, default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
     parser.add_argument('--log_file', type=str, default=None, help='Path to log file')
 
@@ -930,6 +942,9 @@ def main():
         clip_length_s=config.get('clip_length_s', 1.0),
         overlap=overlap,
         sampling_rate=config.get('sampling_rate', 200),
+        l_freq=config.get('l_freq', 1.0),
+        h_freq=config.get('h_freq', 70.0),
+        notch_freq=config.get('notch_freq', 50.0),
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         random_state=config.get('random_state', 42),
@@ -937,7 +952,7 @@ def main():
     )
 
     loggers['main'].info("Processing all files...")
-    preprocessor.process_all(config.get('interpolate_miss_ch', False))
+    preprocessor.process_all(config.get('interpolate_miss_ch', True))
 
     # Validate a specific file if requested
     if 'validate' in config and config['validate']:
