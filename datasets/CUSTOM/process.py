@@ -315,22 +315,19 @@ class MEGPreprocessor:
             # Different rules based on group
             if group == 'Holdout':
                 # For Holdout: only ["jj_add","JJ_add","jj_valid","JJ_valid"]
-                valid_labels = ["jj_add", "jj_valid"]
-                if any(label in description.lower() for label in valid_labels):
+                if "jj" in description.lower():
                     spike_onsets.append(onset)
                     seen_onsets.add(onset)
             
             elif group.startswith('IterativeLearningFeedback1') or group.startswith('IterativeLearningFeedback2'):
                 # For ILF1-2: 'spike' but not 'detected_spike'
-                if 'spike' in description and 'detected_spike' not in description:
+                if 'detected_spike' not in description:
                     spike_onsets.append(onset)
                     seen_onsets.add(onset)
             
             else:
-                # For ILF3-9: 'spike' but not ['true_spike', 'detected_spike']
-                if ('spike' in description and 
-                    'true_spike' not in description and 
-                    'detected_spike' not in description):
+                # For ILF3-9: 'spike' and 'jj' but not ['true_spike', 'detected_spike']
+                if ('true_spike' not in description and 'detected_spike' not in description):
                     spike_onsets.append(onset)
                     seen_onsets.add(onset)
         
