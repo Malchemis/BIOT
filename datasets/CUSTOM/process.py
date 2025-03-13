@@ -4,9 +4,11 @@ import os
 import pickle
 import torch
 import logging
+import yaml
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Set
 from tqdm import tqdm
+from collections import defaultdict
 
 from mne_interpolate import interpolate_missing_channels
 
@@ -75,7 +77,6 @@ class MEGPreprocessor:
         sampling_rate: Target sampling rate in Hz.
         train_ratio: Ratio of patients to use for training.
         val_ratio: Ratio of patients to use for validation.
-        test_ratio: Ratio of patients to use for testing.
         random_state: Random seed for reproducibility.
         clip_length_samples: Length of each clip in samples.
         step_size: Step size in samples between consecutive clips.
@@ -95,7 +96,6 @@ class MEGPreprocessor:
             sampling_rate: int = 200,
             train_ratio: float = 0.7,
             val_ratio: float = 0.15,
-            test_ratio: float = 0.15,
             random_state: int = 42,
             logger: Optional[logging.Logger] = None
     ):
@@ -111,7 +111,6 @@ class MEGPreprocessor:
             sampling_rate: Target sampling rate in Hz.
             train_ratio: Ratio of patients to use for training.
             val_ratio: Ratio of patients to use for validation.
-            test_ratio: Ratio of patients to use for testing.
             random_state: Random seed for reproducibility.
             logger: Logger instance for this class.
 
@@ -125,15 +124,14 @@ class MEGPreprocessor:
         self.sampling_rate = sampling_rate
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
         self.random_state = random_state
 
         # Set up logging
         self.logger = logger or logging.getLogger(__name__)
 
         # Check if ratios sum to 1
-        if abs(self.train_ratio + self.val_ratio + self.test_ratio - 1.0) > 1e-5:
-            error_msg = f"Train, val, and test ratios must sum to 1. Got {self.train_ratio + self.val_ratio + self.test_ratio}"
+        if abs(self.train_ratio + self.val_ratio - 1.0) > 1e-7:
+            error_msg = f"Train and val ratios must sum to 1. Got {self.train_ratio + self.val_ratio}"
             self.logger.error(error_msg)
             raise ValueError(error_msg)
 
@@ -167,6 +165,164 @@ class MEGPreprocessor:
         self.processed_files = {'train': [], 'val': [], 'test': []}
         # Keep track of which patient goes into which split
         self.patient_splits = {}
+        # Store information about patient groups (Holdout, IterativeLearningFeedback1-9)
+        self.patient_groups = {}
+
+    def find_ds_files(self) -> List[Dict[str, str]]:
+        """Find all .ds directories in the hierarchical directory structure.
+
+        Returns:
+            List of dictionaries containing paths to .ds directories, patient IDs, and groups.
+        """
+        ds_files = []
+        self.logger.debug(f"Searching for .ds files in {self.root_dir}")
+        
+        # Look for Holdout and IterativeLearningFeedback* directories
+        for group_dir in os.listdir(self.root_dir):
+            group_path = os.path.join(self.root_dir, group_dir)
+            
+            # Skip if not a directory
+            if not os.path.isdir(group_path):
+                continue
+                
+            # Process each patient directory within the group
+            for patient_dir in os.listdir(group_path):
+                patient_path = os.path.join(group_path, patient_dir)
+                
+                # Skip if not a directory
+                if not os.path.isdir(patient_path):
+                    continue
+                    
+                # Look for .ds files within the patient directory
+                found_ds = False
+                for item in os.listdir(patient_path):
+                    if item.endswith('.ds') and os.path.isdir(os.path.join(patient_path, item)):
+                        ds_path = os.path.join(patient_path, item)
+                        ds_files.append({
+                            'path': ds_path,
+                            'patient_id': patient_dir,
+                            'group': group_dir,
+                            'filename': item
+                        })
+                        found_ds = True
+                        
+                        # Store patient's group information
+                        self.patient_groups[patient_dir] = group_dir
+                
+                if not found_ds:
+                    self.logger.warning(f"No .ds files found for patient {patient_dir} in group {group_dir}")
+
+        self.logger.info(f"Found {len(ds_files)} .ds files across {len(self.patient_groups)} patients")
+        return ds_files
+
+    def split_patients(self) -> Dict[str, List[str]]:
+        """Split patients into train, validation, and test sets.
+
+        This ensures that all data from one patient stays in the same split,
+        with the exception of validation which can overlap with train.
+        All Holdout patients are assigned to the test set.
+
+        Returns:
+            Dictionary mapping split names to lists of patient IDs.
+        """
+        ds_files = self.find_ds_files()
+        
+        # Group patients by their group (Holdout or IterativeLearningFeedback)
+        patients_by_group = defaultdict(set)
+        for file_info in ds_files:
+            patients_by_group[file_info['group']].add(file_info['patient_id'])
+            
+        # All Holdout patients go to the test set
+        test_patients = list(patients_by_group.get('Holdout', set()))
+        self.logger.info(f"Assigned {len(test_patients)} Holdout patients to test set")
+        
+        # Pool all IterativeLearningFeedback patients for train/val split
+        feedback_patients = []
+        for group, patients in patients_by_group.items():
+            if group != 'Holdout':
+                feedback_patients.extend(list(patients))
+                
+        # Remove duplicates
+        feedback_patients = list(set(feedback_patients))
+        
+        # Shuffle remaining patients for train/val split
+        np.random.seed(self.random_state)
+        np.random.shuffle(feedback_patients)
+        
+        # Calculate number for train
+        n_patients = len(feedback_patients)
+        n_train = int(n_patients * self.train_ratio / (self.train_ratio + self.val_ratio))
+        
+        # Split patients
+        train_patients = feedback_patients[:n_train]
+        # For validation, we can include all non-test patients
+        val_patients = feedback_patients[n_train:]
+
+        # Store patient splits
+        for patient in train_patients:
+            self.patient_splits[patient] = 'train'
+        for patient in val_patients:
+            self.patient_splits[patient] = 'val'
+        for patient in test_patients:
+            self.patient_splits[patient] = 'test'
+
+        self.logger.info(f"Patient split: {len(train_patients)} train, {len(val_patients)} val, {len(test_patients)} test")
+        return {'train': train_patients, 'val': val_patients, 'test': test_patients}
+
+    def _get_spike_annotations(self, annotations, group: str) -> List[float]:
+        """Extract spike annotations based on the group's rules.
+
+        Args:
+            annotations: The MNE annotations object
+            group: The dataset group (Holdout or IterativeLearningFeedback*)
+
+        Returns:
+            List of spike onset times in seconds
+        """
+        spike_onsets = []
+        seen_onsets = set()  # Track onsets to avoid duplicates
+        
+        # Extract descriptions and onsets
+        descriptions = annotations.description
+        onsets = annotations.onset
+        
+        for i in range(len(annotations)):
+            description = descriptions[i].lower()
+            onset = onsets[i]
+            
+            # Skip if we've already seen this onset (within a small time window)
+            duplicate = False
+            for seen_onset in seen_onsets:
+                if abs(onset - seen_onset) < 0.01:  # 10ms window for duplicates
+                    duplicate = True
+                    break
+                    
+            if duplicate:
+                continue
+                
+            # Different rules based on group
+            if group == 'Holdout':
+                # For Holdout: only ["jj_add","JJ_add","jj_valid","JJ_valid"]
+                valid_labels = ["jj_add", "jj_valid"]
+                if any(label in description.lower() for label in valid_labels):
+                    spike_onsets.append(onset)
+                    seen_onsets.add(onset)
+            
+            elif group.startswith('IterativeLearningFeedback1') or group.startswith('IterativeLearningFeedback2'):
+                # For ILF1-2: 'spike' but not 'detected_spike'
+                if 'spike' in description and 'detected_spike' not in description:
+                    spike_onsets.append(onset)
+                    seen_onsets.add(onset)
+            
+            else:
+                # For ILF3-9: 'spike' but not ['true_spike', 'detected_spike']
+                if ('spike' in description and 
+                    'true_spike' not in description and 
+                    'detected_spike' not in description):
+                    spike_onsets.append(onset)
+                    seen_onsets.add(onset)
+        
+        return spike_onsets
 
     # Main method
     def process_all(self, interpolate: bool) -> None:
@@ -193,21 +349,22 @@ class MEGPreprocessor:
         # Split patients before processing
         self.split_patients()
 
-        for file_path in tqdm(ds_files, desc="Processing files"):
-            # get patient_id by same procedure as split
-            patient_id = os.path.basename(file_path).split('.')[0].split('_')[0]
+        for file_info in tqdm(ds_files, desc="Processing files"):
+            file_path = file_info['path']
+            patient_id = file_info['patient_id']
+            group = file_info['group']
 
             # Determine which split this patient belongs to
             split = self.patient_splits.get(patient_id, 'train')  # Default to train if not found
-            self.logger.info(f"Processing file {file_path} for patient {patient_id} (split: {split})")
+            self.logger.info(f"Processing file {file_path} for patient {patient_id} (group: {group}, split: {split})")
 
             # Process the file
-            segments, labels, start_positions = self.preprocess_file(file_path, interpolate=interpolate)
+            segments, labels, start_positions = self.preprocess_file(file_path, group, interpolate=interpolate)
 
             if segments is not None and labels is not None and start_positions is not None:
                 # Save the processed segments
                 self.save_segments(segments, labels, start_positions, patient_id,
-                                   os.path.basename(file_path).split('.')[0], split)
+                                   os.path.basename(file_path).split('.')[0], split, group)
             else:
                 self.logger.warning(f"Failed to process file {file_path} - no data returned")
 
@@ -224,75 +381,24 @@ class MEGPreprocessor:
             pickle.dump(self.patient_splits, f)
         self.logger.info(f"Saved patient splits to {patient_splits_file}")
 
+        # Save patient groups information
+        patient_groups_file = os.path.join(self.output_dir, "patient_groups.pkl")
+        with open(patient_groups_file, 'wb') as f:
+            pickle.dump(self.patient_groups, f)
+        self.logger.info(f"Saved patient groups to {patient_groups_file}")
+
         self.logger.info(f"Processing complete. Files saved to {self.output_dir}")
         self.logger.info(f"Train: {len(self.processed_files['train'])} files")
         self.logger.info(f"Val: {len(self.processed_files['val'])} files")
         self.logger.info(f"Test: {len(self.processed_files['test'])} files")
 
-    def find_ds_files(self) -> List[str]:
-        """Find all .ds directories in the root directory.
-
-        Returns:
-            List of paths to .ds directories.
-        """
-        ds_files = []
-        self.logger.debug(f"Searching for .ds files in {self.root_dir}")
-        for item in os.listdir(self.root_dir):
-            if item.endswith('.ds') and os.path.isdir(os.path.join(self.root_dir, item)):
-                ds_files.append(os.path.join(self.root_dir, item))
-
-        self.logger.info(f"Found {len(ds_files)} .ds files")
-        return ds_files
-
-    def split_patients(self) -> Dict[str, List[str]]:
-        """Split patients into train, validation, and test sets.
-
-        This ensures that all data from one patient stays in the same split,
-        preventing data leakage between splits.
-
-        Returns:
-            Dictionary mapping split names to lists of patient IDs.
-        """
-        ds_files = self.find_ds_files()
-        # We split on '.' to remove the extension. If the patient only has one recording, then we don't need to split further
-        # But if the patient has had multiple sessions, we need to split on '_' to get patient ids.
-        patient_ids = [os.path.basename(file_path).split('.')[0].split('_')[0] for file_path in ds_files]
-
-        # Get unique patient IDs (in case multiple recordings from same patient)
-        unique_patients = list(set(patient_ids))
-        self.logger.info(f"Found {len(unique_patients)} unique patients from {len(ds_files)} files")
-
-        # Shuffle patients
-        np.random.seed(self.random_state)
-        np.random.shuffle(unique_patients)
-
-        # Calculate split indices
-        n_patients = len(unique_patients)
-        n_train = int(n_patients * self.train_ratio)
-        n_val = int(n_patients * self.val_ratio)
-
-        # Split patients
-        train_patients = unique_patients[:n_train]
-        val_patients = unique_patients[n_train:n_train + n_val]
-        test_patients = unique_patients[n_train + n_val:]
-
-        # Store patient splits
-        for patient in train_patients:
-            self.patient_splits[patient] = 'train'
-        for patient in val_patients:
-            self.patient_splits[patient] = 'val'
-        for patient in test_patients:
-            self.patient_splits[patient] = 'test'
-
-        self.logger.info(f"Patient split: {len(train_patients)} train, {len(val_patients)} val, {len(test_patients)} test")
-        return {'train': train_patients, 'val': val_patients, 'test': test_patients}
-
-    def preprocess_file(self, file_path: str, interpolate: bool) -> Tuple[
+    def preprocess_file(self, file_path: str, group: str, interpolate: bool) -> Tuple[
         Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """Preprocess a single .ds file.
 
         Args:
             file_path: Path to the .ds file.
+            group: Dataset group (Holdout or IterativeLearningFeedback*)
             interpolate: If True, interpolate missing channels. Else drops to keep only intersection of valid channels.
 
         Returns:
@@ -331,11 +437,11 @@ class MEGPreprocessor:
 
         # Apply bandpass filter (1-70Hz)
         self.logger.debug("Applying bandpass filter (1-70Hz)")
-        raw_file.filter(l_freq=1, h_freq=70)
+        raw_file.filter(l_freq=self.l_freq, h_freq=self.h_freq)
 
         # Apply notch filter (50Hz, power line interference)
         self.logger.debug("Applying notch filter (50Hz)")
-        raw_file.notch_filter(freqs=50)
+        raw_file.notch_filter(freqs=self.notch_freq)
 
         # Get the data
         meg_data = raw_file.get_data()
@@ -352,13 +458,17 @@ class MEGPreprocessor:
             self.logger.warning(f"No annotations found in {file_path}")
             return None, None, None
 
-        # Extract spike annotations
-        spike_onsets = []
-        for i in range(len(annotations)):
-            if 'spike' in annotations[i]['description'].lower():
-                onset_sample = int(annotations[i]['onset'] * self.sampling_rate)
-                spike_onsets.append(onset_sample)
-        self.logger.info(f"Found {len(spike_onsets)} spike annotations in {file_path}")
+        # Extract spike annotations based on group rules
+        spike_onsets = self._get_spike_annotations(annotations, group)
+        
+        if len(spike_onsets) == 0:
+            self.logger.warning(f"No valid spike annotations found in {file_path} using rules for {group}")
+            return None, None, None
+            
+        self.logger.info(f"Found {len(spike_onsets)} valid spike annotations in {file_path}")
+
+        # Convert spike onsets from seconds to samples
+        spike_onset_samples = [int(onset * self.sampling_rate) for onset in spike_onsets]
 
         # Get total length in samples
         n_samples = meg_data.shape[1]
@@ -374,7 +484,7 @@ class MEGPreprocessor:
             segment = meg_data[:, start:end]  # take the segment across channels
 
             # Check if any spike occurs in this segment
-            has_spike = any(start <= spike_onset < end for spike_onset in spike_onsets)
+            has_spike = any(start <= spike_onset < end for spike_onset in spike_onset_samples)
             segments.append(segment)
             labels.append(1 if has_spike else 0)
 
@@ -393,7 +503,8 @@ class MEGPreprocessor:
                       start_positions: np.ndarray,
                       patient_id: str,
                       filename_origin: str,
-                      split: str) -> None:
+                      split: str,
+                      group: str) -> None:
         """Save preprocessed segments to disk.
 
         Args:
@@ -403,6 +514,7 @@ class MEGPreprocessor:
             patient_id: Patient identifier.
             filename_origin: The name of the original filename
             split: Data split ('train', 'val', or 'test').
+            group: Dataset group (Holdout or IterativeLearningFeedback*)
         """
         if segments.shape[0] == 0:
             self.logger.warning(f"No segments found for patient {patient_id}")
@@ -422,7 +534,8 @@ class MEGPreprocessor:
                 'patient_id': patient_id,
                 'original_filename': filename_origin,
                 'start_position': int(start_positions[i]),
-                'original_index': i
+                'original_index': i,
+                'group': group
             }, file_path)
 
             self.processed_files[split].append(
@@ -457,11 +570,16 @@ def validate_dataset(raw_data_file_path: Path,
     logger = logger or logging.getLogger(__name__)
     import matplotlib
     import matplotlib.pyplot as plt
-    matplotlib.use('TkAgg')
+    if show_plot:
+        matplotlib.use('TkAgg')
 
-    # Extract patient ID from basename
-    patient_id_plus_session = os.path.basename(raw_data_file_path).split('.')[0]
-    logger.info(f"Validating patient: {patient_id_plus_session}")
+    # Extract patient ID from the directory structure
+    # For the new structure, patient_id is the parent directory name
+    patient_id = os.path.basename(os.path.dirname(raw_data_file_path))
+    group = os.path.basename(os.path.dirname(os.path.dirname(raw_data_file_path)))
+    filename_origin = os.path.basename(raw_data_file_path).split('.')[0]
+    
+    logger.info(f"Validating patient: {patient_id}, group: {group}, file: {filename_origin}")
 
     # Load the original .ds file
     try:
@@ -480,19 +598,28 @@ def validate_dataset(raw_data_file_path: Path,
     # Create a binary array for original data based on annotations
     original_binary = np.zeros(n_samples)
 
-    # Extract spike annotations
-    spike_times = []
-    for annot in raw_file.annotations:
-        if 'spike' in annot['description'].lower():
-            onset_sample = int(annot['onset'] * orig_sfreq)
-            spike_times.append(annot['onset'])
-            # Mark a window around the spike
-            window_samples = int(1.0 * orig_sfreq)  # 1-second window
-            start = max(0, onset_sample - window_samples // 2)
-            end = min(n_samples, onset_sample + window_samples // 2)
-            original_binary[start:end] = 1
+    # Extract spike annotations based on group rules
+    # Create a temporary MEGPreprocessor to reuse the annotation extraction logic
+    temp_processor = MEGPreprocessor(
+        root_dir="",
+        output_dir="",
+        good_channels_file_path="",
+        loc_meg_channels_file_path="",
+        logger=logger
+    )
+    
+    # Get spike annotations using the same rules as during processing
+    spike_onsets = temp_processor._get_spike_annotations(raw_file.annotations, group)
+    
+    logger.info(f"Found {len(spike_onsets)} spike annotations in original file")
 
-    logger.info(f"Found {len(spike_times)} spike annotations in original file")
+    for onset in spike_onsets:
+        onset_sample = int(onset * orig_sfreq)
+        # Mark a window around the spike
+        window_samples = int(1.0 * orig_sfreq)  # 1-second window
+        start = max(0, onset_sample - window_samples // 2)
+        end = min(n_samples, onset_sample + window_samples // 2)
+        original_binary[start:end] = 1
 
     # Find all processed fragments for this patient
     logger.info("Looking for processed fragments...")
@@ -501,7 +628,7 @@ def validate_dataset(raw_data_file_path: Path,
         split_dir = os.path.join(processed_data_root, split)
         if os.path.exists(split_dir):
             for file in os.listdir(split_dir):
-                if patient_id_plus_session in file and file.endswith('.pt'):
+                if patient_id in file and filename_origin in file and file.endswith('.pt'):
                     fragment_path = os.path.join(split_dir, file)
                     try:
                         fragment = torch.load(fragment_path)
@@ -510,7 +637,7 @@ def validate_dataset(raw_data_file_path: Path,
                         logger.error(f"Error loading {fragment_path}: {e}")
 
     if not all_fragments:
-        error_msg = f"No processed fragments found for patient {patient_id_plus_session}"
+        error_msg = f"No processed fragments found for patient {patient_id}, file {filename_origin}"
         logger.error(error_msg)
         raise ValueError(error_msg)
 
@@ -538,8 +665,8 @@ def validate_dataset(raw_data_file_path: Path,
         logger.warning("No position information found in fragments!")
         # Fall back to approximate method - try to match spike patterns
         logger.info("Attempting to match spike patterns based on timing")
-        for spike_time in spike_times:
-            spike_sample = int(spike_time * processed_sfreq)
+        for onset in spike_onsets:
+            spike_sample = int(onset * processed_sfreq)
             window_start = max(0, spike_sample - clip_length_samples // 2)
             window_end = min(len(reconstructed_binary), spike_sample + clip_length_samples // 2)
             reconstructed_binary[window_start:window_end] = 1
@@ -551,12 +678,12 @@ def validate_dataset(raw_data_file_path: Path,
     # Plot original binary signal
     time_orig = np.arange(n_samples) / orig_sfreq
     ax1.plot(time_orig, original_binary, 'b-', label='Original')
-    ax1.set_title(f'Original MEG Recording: {patient_id_plus_session} ({len(spike_times)} spikes)')
+    ax1.set_title(f'Original MEG Recording: {patient_id} ({len(spike_onsets)} spikes)')
     ax1.set_ylabel('Spike Present')
 
     # Add vertical lines for exact spike times
-    for t in spike_times:
-        ax1.axvline(x=t, color='r', linestyle='--', alpha=0.5)
+    for onset in spike_onsets:
+        ax1.axvline(x=onset, color='r', linestyle='--', alpha=0.5)
 
     ax1.legend()
 
@@ -570,7 +697,7 @@ def validate_dataset(raw_data_file_path: Path,
 
     # Adjust display
     plt.tight_layout()
-    plot_path = os.path.join(processed_data_root, f"{patient_id_plus_session}_validation.png")
+    plot_path = os.path.join(processed_data_root, f"{patient_id}_{filename_origin}_validation.png")
     plt.savefig(plot_path)
     logger.info(f"Saved validation plot to {plot_path}")
     if show_plot:
@@ -582,7 +709,7 @@ def validate_dataset(raw_data_file_path: Path,
     frag_spike_percentage = (spike_fragments / len(all_fragments)) * 100
 
     logger.info("Validation Summary:")
-    logger.info(f"Original recording: {duration_s:.2f}s, {len(spike_times)} annotated spikes ({orig_spike_percentage:.2f}% of time)")
+    logger.info(f"Original recording: {duration_s:.2f}s, {len(spike_onsets)} annotated spikes ({orig_spike_percentage:.2f}% of time)")
     logger.info(f"Processed fragments: {len(all_fragments)} total, {spike_fragments} with spikes ({frag_spike_percentage:.2f}%)")
 
 
@@ -654,14 +781,27 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
     try:
         with open(os.path.join(output_dir, "patient_splits.pkl"), 'rb') as f:
             patient_splits = pickle.load(f)
+        
+        with open(os.path.join(output_dir, "patient_groups.pkl"), 'rb') as f:
+            patient_groups = pickle.load(f)
 
         logger.info("Patient distribution across splits:")
         split_counts = {"train": 0, "val": 0, "test": 0}
+        group_counts = defaultdict(lambda: {"train": 0, "val": 0, "test": 0})
+        
         for patient, split in patient_splits.items():
             split_counts[split] += 1
+            group = patient_groups.get(patient, "Unknown")
+            group_counts[group][split] += 1
 
         for split, count in split_counts.items():
             logger.info(f"  {split.capitalize()}: {count} patients")
+            
+        logger.info("Patient distribution by group and split:")
+        for group, splits in group_counts.items():
+            logger.info(f"  {group}:")
+            for split, count in splits.items():
+                logger.info(f"    {split.capitalize()}: {count} patients")
     except FileNotFoundError:
         logger.warning("Patient split information not found")
 
@@ -719,17 +859,20 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='MEG Data Preprocessing')
-    parser.add_argument('--root_dir', type=str, required=True, help='Directory containing .ds files')
-    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save processed data')
-    parser.add_argument('--good_channels_file_path', type=str, required=True, help='Path to the file containing the list of good channels')
-    parser.add_argument('--loc_meg_channels_file_path', type=str, required=True, help='Path to the file containing the list of locations of meg channels')
+    parser.add_argument('--config', type=str, help='Path to YAML configuration file')
+    parser.add_argument('--root_dir', type=str, help='Directory containing .ds files')
+    parser.add_argument('--output_dir', type=str, help='Directory to save processed data')
+    parser.add_argument('--good_channels_file_path', type=str, help='Path to the file containing the list of good channels')
+    parser.add_argument('--loc_meg_channels_file_path', type=str, help='Path to the file containing the list of locations of meg channels')
     parser.add_argument('--interpolate_miss_ch', action='store_true', help='Interpolate missing channels (if false, we drop the missing channels)')
     parser.add_argument('--clip_length_s', type=float, default=1.0, help='Length of each clip in seconds')
-    parser.add_argument('--overlap', type=float, default=0.5, help='Fraction of overlap between consecutive clips (0.0 to <1.0)')
+    parser.add_argument('--overlap', type=float, default=0.0, help='Fraction of overlap between consecutive clips (0.0 to <1.0)')
     parser.add_argument('--sampling_rate', type=int, default=200, help='Target sampling rate in Hz')
+    parser.add_argument('--l_freq', type=float, default=1.0, help='Low-pass filter frequency in Hz')
+    parser.add_argument('--h_freq', type=float, default=70.0, help='High-pass filter frequency in Hz')
+    parser.add_argument('--notch_freq', type=float, default=50.0, help='Notch filter frequency in Hz')
     parser.add_argument('--train_ratio', type=float, default=0.5, help='Ratio of patients for training')
     parser.add_argument('--val_ratio', type=float, default=0.25, help='Ratio of patients for validation')
-    parser.add_argument('--test_ratio', type=float, default=0.25, help='Ratio of patients for testing')
     parser.add_argument('--random_state', type=int, default=42, help='Random seed')
     parser.add_argument('--validate', type=str, default=None, help='Path to a specific .ds file to validate after processing')
     parser.add_argument('--test', action='store_true', help='Test the datasets after processing')
@@ -738,74 +881,79 @@ def main():
 
     args = parser.parse_args()
 
+    # Load configuration from YAML if provided
+    config = {}
+    if args.config:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    
+    # Merge CLI arguments with config file (CLI args override config)
+    # Convert args to dict, skipping None values (not provided)
+    args_dict = {k: v for k, v in vars(args).items() if v is not None and k != 'config'}
+    
+    # Merge config with args_dict (args take precedence)
+    for key, value in args_dict.items():
+        config[key] = value
+    
+    # Check if required arguments are provided
+    required_args = ['root_dir', 'output_dir', 'good_channels_file_path', 'loc_meg_channels_file_path']
+    missing_args = [arg for arg in required_args if arg not in config]
+    if missing_args:
+        raise ValueError(f"Missing required arguments: {', '.join(missing_args)}")
+
     mne.set_log_level(verbose=logging.ERROR)  # Suppress MNE output
 
     # Check if ratios sum to 1
-    if abs(args.train_ratio + args.val_ratio + args.test_ratio - 1.0) > 1e-5:
-        raise ValueError(
-            f"Train, val, and test ratios must sum to 1. Got {args.train_ratio + args.val_ratio + args.test_ratio}")
+    train_ratio = config.get('train_ratio', 0.8)
+    val_ratio = config.get('val_ratio', 0.2)
+    
+    if abs(train_ratio + val_ratio - 1.0) > 1e-7:
+        raise ValueError(f"Train and val ratios must sum to 1. Got {train_ratio + val_ratio}")
 
     # Check if overlap is valid
-    if args.overlap < 0.0 or args.overlap >= 1.0:
+    overlap = config.get('overlap', 0.0)
+    if overlap < 0.0 or overlap >= 1.0:
         raise ValueError("Overlap must be between 0.0 and less than 1.0")
 
     # Set up logging
-    loggers = setup_logging(args.log_level, args.log_file)
+    log_level = config.get('log_level', 'INFO')
+    log_file = config.get('log_file', None)
+    loggers = setup_logging(log_level, log_file)
 
     # Initialize and run preprocessor
     loggers['main'].info("Starting MEG preprocessing pipeline...")
     preprocessor = MEGPreprocessor(
-        root_dir=args.root_dir,
-        output_dir=args.output_dir,
-        good_channels_file_path=args.good_channels_file_path,
-        loc_meg_channels_file_path=args.loc_meg_channels_file_path,
-        clip_length_s=args.clip_length_s,
-        overlap=args.overlap,
-        sampling_rate=args.sampling_rate,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        random_state=args.random_state,
+        root_dir=config['root_dir'],
+        output_dir=config['output_dir'],
+        good_channels_file_path=config['good_channels_file_path'],
+        loc_meg_channels_file_path=config['loc_meg_channels_file_path'],
+        clip_length_s=config.get('clip_length_s', 1.0),
+        overlap=overlap,
+        sampling_rate=config.get('sampling_rate', 200),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        random_state=config.get('random_state', 42),
         logger=loggers['processor']
     )
 
     loggers['main'].info("Processing all files...")
-    preprocessor.process_all(args.interpolate_miss_ch)
+    preprocessor.process_all(config.get('interpolate_miss_ch', False))
 
     # Validate a specific file if requested
-    if args.validate:
+    if 'validate' in config and config['validate']:
         loggers['main'].info("Validating by reconstructing a given .ds...")
         validate_dataset(
-            raw_data_file_path=Path(args.validate),
-            processed_data_root=Path(args.output_dir),
-            processed_sfreq=args.sampling_rate,
+            raw_data_file_path=Path(config['validate']),
+            processed_data_root=Path(config['output_dir']),
+            processed_sfreq=config.get('sampling_rate', 200),
             logger=loggers['validator']
         )
 
     # Test the datasets if requested
-    if args.test:
+    if config.get('test', False):
         loggers['main'].info("Testing datasets by getting sample's distribution...")
-        test_datasets(args.output_dir, logger=loggers['dataset'])
+        test_datasets(config['output_dir'], logger=loggers['dataset'])
 
 
 if __name__ == "__main__":
-    # Example arguments
-    # args = {
-    #     "root_dir": "/home/malchemis/PycharmProjects/bio-sig-analysis/data/raw/crnl-meg/sample-data",
-    #     "output_dir": "/home/malchemis/PycharmProjects/bio-sig-analysis/data/processed/crnl-meg",
-    #     "good_channels_file_path": "/home/malchemis/PycharmProjects/BIOT/datasets/CUSTOM/good_channels",
-    #     "loc_meg_channels_file_path": "/home/malchemis/PycharmProjects/BIOT/datasets/CUSTOM/loc_meg_channels.pkl",
-    #     "interpolate_miss_ch": True
-    #     "clip_length_s": 1.0,
-    #     "overlap": 0.5,
-    #     "sampling_rate": 200,
-    #     "train_ratio": 0.7,
-    #     "val_ratio": 0.15,
-    #     "test_ratio": 0.15,
-    #     "random_state": 42,
-    #     "validate": '/home/malchemis/PycharmProjects/bio-sig-analysis/data/raw/crnl-meg/sample-data/chada_Epi-001_20070124_03.ds',
-    #     "test": True
-    #     "log_level": "INFO",
-    #     "log_file": "/home/malchemis/PycharmProjects/bio-sig-analysis/logs/meg_preprocessing.log"
-    # }
     main()

@@ -1,7 +1,9 @@
 import random
-
 import os
 import argparse
+import logging
+from pathlib import Path
+from datetime import datetime
 
 import torch
 import numpy as np
@@ -21,10 +23,19 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss#, BCE
+from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss
 
 
 class LitModel_finetune(pl.LightningModule):
+    """PyTorch Lightning module for fine-tuning binary classification models.
+    
+    This class wraps various neural network models to enable training, validation,
+    and testing with PyTorch Lightning.
+    
+    Args:
+        args (argparse.Namespace): Command-line arguments
+        model: The neural network model to use
+    """
     def __init__(self, args: argparse.Namespace, model):
         super().__init__()
         self.model = model
@@ -32,16 +43,34 @@ class LitModel_finetune(pl.LightningModule):
         self.args = args
         self.validation_step_outputs = []
         self.test_step_outputs = []
+        self.custom_logger = logging.getLogger(__name__)
 
     def training_step(self, batch, batch_idx):
+        """Perform a single training step.
+        
+        Args:
+            batch: A batch of data (inputs and targets)
+            batch_idx: Index of the batch
+            
+        Returns:
+            The calculated loss
+        """
         X, y = batch
         prob = self.model(X)
-        # loss = BCE(prob, y)
         loss = focal_loss(prob, y)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
+        """Perform a single validation step.
+        
+        Args:
+            batch: A batch of data (inputs and targets)
+            batch_idx: Index of the batch
+            
+        Returns:
+            Tuple of predictions and ground truth
+        """
         X, y = batch
         with torch.no_grad():
             prob = self.model(X)
@@ -52,11 +81,11 @@ class LitModel_finetune(pl.LightningModule):
         return step_result, step_gt
 
     def on_validation_epoch_start(self):
-        # Clear the list at the start of validation
+        """Initialize validation outputs collection at the start of validation."""
         self.validation_step_outputs = []
 
     def on_validation_epoch_end(self):
-        # Process the outputs without parameters
+        """Process validation outputs at the end of validation epoch."""
         val_step_outputs = self.validation_step_outputs
         result = np.array([])
         gt = np.array([])
@@ -86,9 +115,18 @@ class LitModel_finetune(pl.LightningModule):
         self.log("val_auroc", result["roc_auc"], sync_dist=True)
         self.log("val_f1", result["f1"], sync_dist=True)
         self.log("best_threshold", self.threshold, sync_dist=True)
-        print(result)
+        self.custom_logger.info(f"Validation metrics: {result}")
 
     def test_step(self, batch, batch_idx):
+        """Perform a single test step.
+        
+        Args:
+            batch: A batch of data (inputs and targets)
+            batch_idx: Index of the batch
+            
+        Returns:
+            Tuple of predictions and ground truth
+        """
         X, y = batch
         with torch.no_grad():
             convScore = self.model(X)
@@ -99,11 +137,11 @@ class LitModel_finetune(pl.LightningModule):
         return step_result, step_gt
 
     def on_test_epoch_start(self):
-        # Clear the list at the start of testing
+        """Initialize test outputs collection at the start of testing."""
         self.test_step_outputs = []
 
     def on_test_epoch_end(self):
-        # Process the outputs without parameters
+        """Process test outputs at the end of test epoch."""
         test_step_outputs = self.test_step_outputs
         result = np.array([])
         gt = np.array([])
@@ -123,16 +161,23 @@ class LitModel_finetune(pl.LightningModule):
                 "balanced_accuracy": 0.0,
                 "pr_auc": 0.0,
                 "roc_auc": 0.0,
+                "f1": 0.0,
             }
         self.log("test_acc", result["accuracy"], sync_dist=True)
         self.log("test_bacc", result["balanced_accuracy"], sync_dist=True)
         self.log("test_pr_auc", result["pr_auc"], sync_dist=True)
         self.log("test_auroc", result["roc_auc"], sync_dist=True)
         self.log("test_f1", result["f1"], sync_dist=True)
-
+        self.custom_logger.info(f"Test metrics: {result}")
+        
         return result
 
     def configure_optimizers(self):
+        """Configure optimizer for training.
+        
+        Returns:
+            List of optimizers
+        """
         optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=self.args.lr,
@@ -141,15 +186,30 @@ class LitModel_finetune(pl.LightningModule):
 
         return [optimizer]  # , [scheduler]
 
+
 def seed_worker(worker_id):
+    """Set seed for workers to ensure reproducibility.
+    
+    Args:
+        worker_id: ID of the worker
+    """
     # Set seed for Python and NumPy in each worker
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+
 def prepare_custom_dataloader(args):
-    # set random seed
-    seed = 12345
+    """Prepare dataloaders for MEG dataset.
+    
+    Args:
+        args: Command-line arguments containing dataset parameters
+        
+    Returns:
+        Tuple of train, test, and validation data loaders
+    """
+    # Set random seed for reproducibility
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -158,16 +218,19 @@ def prepare_custom_dataloader(args):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    root = "/home/malchemis/PycharmProjects/bio-sig-analysis/data/processed/crnl-meg-600Hz"
+    logger = logging.getLogger(__name__)
+    
+    # Use the specified data root path
+    root = os.path.join(args.data_dir, "crnl-meg")
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
     val_files = os.listdir(os.path.join(root, "val"))
     test_files = os.listdir(os.path.join(root, "test"))
 
-    print("Size of train, val, and test file list: ", len(train_files), len(val_files), len(test_files))
+    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
 
-    # prepare training and test data loader
+    # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
         MEGDataset(os.path.join(root, "train"), train_files),
         batch_size=args.batch_size,
@@ -193,29 +256,39 @@ def prepare_custom_dataloader(args):
         persistent_workers=True,
         worker_init_fn=seed_worker
     )
-    print("Size of train, val, and test loaders: ",len(train_loader), len(val_loader), len(test_loader))
+    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
     return train_loader, test_loader, val_loader
 
 
 def prepare_TUAB_dataloader(args):
-    # set random seed
-    seed = 12345
+    """Prepare dataloaders for TUAB dataset.
+    
+    Args:
+        args: Command-line arguments containing dataset parameters
+        
+    Returns:
+        Tuple of train, test, and validation data loaders
+    """
+    # Set random seed for reproducibility
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/TUH/tuh3/tuh_eeg_abnormal/v3.0.0/edf/processed"
+    logger = logging.getLogger(__name__)
+    
+    # Use the specified data root path
+    root = os.path.join(args.data_dir, "tuh_eeg_abnormal/v3.0.0/edf/processed")
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
-    # train_files = train_files[:100000]
     val_files = os.listdir(os.path.join(root, "val"))
     test_files = os.listdir(os.path.join(root, "test"))
 
-    print(len(train_files), len(val_files), len(test_files))
+    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
 
-    # prepare training and test data loader
+    # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
         TUABLoader(os.path.join(root, "train"),
                    train_files, args.sampling_rate),
@@ -239,27 +312,38 @@ def prepare_TUAB_dataloader(args):
         num_workers=args.num_workers,
         persistent_workers=True,
     )
-    print(len(train_loader), len(val_loader), len(test_loader))
+    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
     return train_loader, test_loader, val_loader
 
 
 def prepare_CHB_MIT_dataloader(args):
-    # set random seed
-    seed = 12345
+    """Prepare dataloaders for CHB-MIT dataset.
+    
+    Args:
+        args: Command-line arguments containing dataset parameters
+        
+    Returns:
+        Tuple of train, test, and validation data loaders
+    """
+    # Set random seed for reproducibility
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_segments"
+    logger = logging.getLogger(__name__)
+    
+    # Use the specified data root path
+    root = os.path.join(args.data_dir, "physionet.org/files/chbmit/1.0.0/clean_segments")
 
     train_files = os.listdir(os.path.join(root, "train"))
     val_files = os.listdir(os.path.join(root, "val"))
     test_files = os.listdir(os.path.join(root, "test"))
 
-    print(len(train_files), len(val_files), len(test_files))
+    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
 
-    # prepare training and test data loader
+    # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
         CHBMITLoader(os.path.join(root, "train"),
                      train_files, args.sampling_rate),
@@ -284,27 +368,38 @@ def prepare_CHB_MIT_dataloader(args):
         num_workers=args.num_workers,
         persistent_workers=True,
     )
-    print(len(train_loader), len(val_loader), len(test_loader))
+    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
     return train_loader, test_loader, val_loader
 
 
 def prepare_PTB_dataloader(args):
-    # set random seed
-    seed = 12345
+    """Prepare dataloaders for PTB dataset.
+    
+    Args:
+        args: Command-line arguments containing dataset parameters
+        
+    Returns:
+        Tuple of train, test, and validation data loaders
+    """
+    # Set random seed for reproducibility
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/WFDB/processed2"
+    logger = logging.getLogger(__name__)
+    
+    # Use the specified data root path
+    root = os.path.join(args.data_dir, "WFDB/processed2")
 
     train_files = os.listdir(os.path.join(root, "train"))
     val_files = os.listdir(os.path.join(root, "val"))
     test_files = os.listdir(os.path.join(root, "test"))
 
-    print(len(train_files), len(val_files), len(test_files))
+    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
 
-    # prepare training and test data loader
+    # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
         PTBLoader(os.path.join(root, "train"),
                   train_files, args.sampling_rate),
@@ -328,18 +423,41 @@ def prepare_PTB_dataloader(args):
         num_workers=args.num_workers,
         persistent_workers=True,
     )
-    print(len(train_loader), len(val_loader), len(test_loader))
+    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
     return train_loader, test_loader, val_loader
 
 
 def supervised(args):
-    # get data loaders
+    """Main function to run supervised training and evaluation.
+    
+    Args:
+        args: Command-line arguments
+    """
+    logger = logging.getLogger(__name__)
+    
+    # Setup logging
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_file = os.path.join(args.log_dir, f"{args.dataset}-{args.model}-{timestamp}.log")
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    # Get data loaders
+    logger.info(f"Preparing data loaders for dataset: {args.dataset}")
     if args.dataset == "MEG":
         train_loader, test_loader, val_loader = prepare_custom_dataloader(args)
+    elif args.dataset == "TUAB":
+        train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
+    elif args.dataset == "CHB-MIT":
+        train_loader, test_loader, val_loader = prepare_CHB_MIT_dataloader(args)
+    elif args.dataset == "PTB":
+        train_loader, test_loader, val_loader = prepare_PTB_dataloader(args)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Dataset {args.dataset} not implemented")
 
-    # define the model
+    # Define the model
+    logger.info(f"Initializing model: {args.model}")
     if args.model == "SPaRCNet":
         model = SPaRCNet(
             in_channels=args.in_channels,
@@ -396,33 +514,36 @@ def supervised(args):
     elif args.model == "BIOT":
         model = BIOTClassifier(
             n_classes=args.n_classes,
-            # set the n_channels according to the pretrained model if necessary
             n_channels=args.in_channels,
-            # if nfft 200 and hop length 100 -> 50% overlap
             n_fft=args.token_size,
             hop_length=args.hop_length,
+            raw=args.raw, 
+            patch_size=args.patch_size, 
+            overlap=args.overlap,
         )
         if args.pretrain_model_path and (args.sampling_rate == 200):
             model.biot.load_state_dict(torch.load(args.pretrain_model_path))
-            print(f"load pretrain model from {args.pretrain_model_path}")
+            logger.info(f"Loaded pretrained model from {args.pretrain_model_path}")
 
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Model {args.model} not implemented")
+        
     lightning_model = LitModel_finetune(args, model)
 
-    # logger and callbacks
+    # Logger and callbacks
     version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
-    logger = TensorBoardLogger(
-        save_dir="./log",
+    tensorboard_logger = TensorBoardLogger(
+        save_dir=args.model_log_dir,
         version=version,
         name="",
     )
 
-    dirpath = logger.log_dir
+    dirpath = tensorboard_logger.log_dir
+    os.makedirs(dirpath, exist_ok=True)
 
     # Early stopping to monitor PR AUC
     early_stop_callback = EarlyStopping(
-        monitor="val_pr_auc", patience=10, verbose=True, mode="max"
+        monitor="val_pr_auc", patience=args.patience, verbose=True, mode="max"
     )
 
     # Save the best 3 models, and monitor PR AUC
@@ -446,25 +567,25 @@ def supervised(args):
     )
 
     trainer = pl.Trainer(
-        devices=[0],
+        devices=args.gpus,
         accelerator="auto",
         strategy=DDPStrategy(find_unused_parameters=True),
         benchmark=True,
         enable_checkpointing=True,
-        logger=logger,
+        logger=tensorboard_logger,
         max_epochs=args.epochs,
         callbacks=[early_stop_callback, best_checkpoint_callback, last_checkpoint_callback],
     )
 
-    # train the model
-    print("Starting model training...")
+    # Train the model
+    logger.info("Starting model training...")
     trainer.fit(
         lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
     )
-    print("Training completed")
+    logger.info("Training completed")
 
     # Test with the best models
-    print("Testing with best models...")
+    logger.info("Testing with best models...")
     if hasattr(best_checkpoint_callback, 'best_k_models') and best_checkpoint_callback.best_k_models:
         # Sort models by score (higher PR AUC is better)
         sorted_models = sorted(
@@ -472,78 +593,119 @@ def supervised(args):
             reverse=True  # Higher score is better since we're using max mode
         )
 
-        print(f"Found {len(sorted_models)} best models")
+        logger.info(f"Found {len(sorted_models)} best models")
         for i, (score, path) in enumerate(sorted_models):
-            print(f"Testing best model {i + 1}/{len(sorted_models)}: {path}")
+            logger.info(f"Testing best model {i + 1}/{len(sorted_models)}: {path}")
             result = trainer.test(
                 model=lightning_model, ckpt_path=path, dataloaders=test_loader
             )[0]
-            print(f"Best model {i + 1} test results (PR AUC: {score.item():.4f}):")
-            print(result)
+            logger.info(f"Best model {i + 1} test results (PR AUC: {score.item():.4f}):")
+            logger.info(f"{result}")
     else:
-        print("No best model checkpoints found")
+        logger.info("No best model checkpoints found")
 
     # Test with the last model
-    print("Testing with last model...")
+    logger.info("Testing with last model...")
     last_model_path = os.path.join(dirpath, "last.ckpt")
     if os.path.exists(last_model_path):
-        print(f"Found last model at: {last_model_path}")
+        logger.info(f"Found last model at: {last_model_path}")
         last_result = trainer.test(
             model=lightning_model, ckpt_path=last_model_path, dataloaders=test_loader
         )[0]
-        print("Last model test results:")
-        print(last_result)
+        logger.info("Last model test results:")
+        logger.info(f"{last_result}")
     else:
         # Fallback - look for the filename pattern if the default path doesn't exist
         last_checkpoints = [f for f in os.listdir(dirpath) if f.startswith("last-epoch=")]
         if last_checkpoints:
             last_model_path = os.path.join(dirpath, last_checkpoints[0])
-            print(f"Found last model at alternative path: {last_model_path}")
+            logger.info(f"Found last model at alternative path: {last_model_path}")
             last_result = trainer.test(
                 model=lightning_model, ckpt_path=last_model_path, dataloaders=test_loader
             )[0]
-            print("Last model test results:")
-            print(last_result)
+            logger.info("Last model test results:")
+            logger.info(f"{last_result}")
         else:
-            print("No last model checkpoint found")
+            logger.info("No last model checkpoint found")
+
+
+def setup_logging(args):
+    """Set up logging configuration.
+    
+    Args:
+        args: Command-line arguments with logging parameters
+    """
+    # Create log directory if it doesn't exist
+    os.makedirs(args.log_dir, exist_ok=True)
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(args.log_level)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(args.log_level)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(console_handler)
+    
+    # File handler for the main log file
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    main_log_file = os.path.join(args.log_dir, f"main-{timestamp}.log")
+    file_handler = logging.FileHandler(main_log_file)
+    file_handler.setLevel(args.log_level)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(file_handler)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="number of epochs")
+    parser = argparse.ArgumentParser(description="Train and evaluate binary classification models")
+    
+    # General parameters
+    parser.add_argument("--seed", type=int, default=12345, help="random seed for reproducibility")
+    parser.add_argument("--log_dir", type=str, default="./logs", help="directory to save logs")
+    parser.add_argument("--model_log_dir", type=str, default="./models", help="directory to save model checkpoints and related logs")
+    parser.add_argument("--data_dir", type=str, default="./data/processed", help="base directory for datasets")
+    parser.add_argument("--log_level", type=str, default="INFO", 
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        help="logging level")
+    
+    # Training parameters
+    parser.add_argument("--epochs", type=int, default=100, help="number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
-    parser.add_argument("--weight_decay", type=float,
-                        default=1e-5, help="weight decay")
-    parser.add_argument("--batch_size", type=int,
-                        default=512, help="batch size")
-    parser.add_argument("--num_workers", type=int,
-                        default=32, help="number of workers")
-    parser.add_argument("--dataset", type=str, default="TUAB", help="dataset")
-    parser.add_argument(
-        "--model", type=str, default="SPaRCNet", help="which supervised model to use"
-    )
-    parser.add_argument(
-        "--in_channels", type=int, default=16, help="number of input channels"
-    )
-    parser.add_argument(
-        "--sample_length", type=float, default=10, help="length (s) of sample"
-    )
-    parser.add_argument(
-        "--n_classes", type=int, default=1, help="number of output classes"
-    )
-    parser.add_argument(
-        "--sampling_rate", type=int, default=200, help="sampling rate (r)"
-    )
-    parser.add_argument("--token_size", type=int,
-                        default=200, help="token size (t)")
-    parser.add_argument(
-        "--hop_length", type=int, default=100, help="token hop length (t - p)"
-    )
-    parser.add_argument(
-        "--pretrain_model_path", type=str, default="", help="pretrained model path"
-    )
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="weight decay")
+    parser.add_argument("--batch_size", type=int, default=512, help="batch size")
+    parser.add_argument("--num_workers", type=int, default=32, help="number of workers")
+    parser.add_argument("--patience", type=int, default=5, help="patience for early stopping")
+    parser.add_argument("--gpus", type=list, default=[0], help="GPU devices to use")
+    
+    # Dataset parameters
+    parser.add_argument("--dataset", type=str, default="MEG", 
+                        choices=["MEG", "TUAB", "CHB-MIT", "PTB"],
+                        help="which dataset to use")
+    
+    # Model parameters
+    parser.add_argument("--model", type=str, default="SPaRCNet", 
+                       choices=["SPaRCNet", "ContraWR", "CNNTransformer", "FFCL", "STTransformer", "BIOT"],
+                       help="which supervised model to use")
+    parser.add_argument("--in_channels", type=int, default=16, help="number of input channels")
+    parser.add_argument("--sample_length", type=float, default=10, help="length (s) of sample")
+    parser.add_argument("--n_classes", type=int, default=1, help="number of output classes")
+    parser.add_argument("--sampling_rate", type=int, default=200, help="sampling rate (r)")
+    parser.add_argument("--token_size", type=int, default=200, help="token size (t)")
+    parser.add_argument("--hop_length", type=int, default=100, help="token hop length (t - p)")
+    parser.add_argument("--raw", type=bool, default=False, help="Whether to use raw data/time series or stft")
+    parser.add_argument("--patch_size", type=int, default=100, help="Size of a patch/ time segment in case raw data is used")
+    parser.add_argument("--overlap", type=float, default=0.0, help="overlap percentage for patches in case raw data is used")
+    parser.add_argument("--pretrain_model_path", type=str, default="", help="pretrained model path")
+    
     arguments = parser.parse_args()
-    print(arguments)
-
+    
+    # Set up logging first
+    setup_logging(arguments)
+    
+    # Get logger for this module
+    logger = logging.getLogger(__name__)
+    logger.info(f"Arguments: {arguments}")
+    
+    # Run the supervised training process
     supervised(arguments)
