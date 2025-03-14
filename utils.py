@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import os
 from scipy.signal import resample
-from typing import List, Tuple, Optional, Dict, Any, Union
+from typing import List, Tuple, Optional, Dict, Union
 
 
 class MEGDataset(torch.utils.data.Dataset):
@@ -15,30 +15,23 @@ class MEGDataset(torch.utils.data.Dataset):
     Each data sample contains the MEG signal and its associated label.
 
     Attributes:
-        root (str): Root directory containing the processed data.
-        files (List[str]): List of filenames to use.
-        logger (logging.Logger): Logger for this class.
+        root: Root directory containing the processed data.
+        files: List of filenames to use.
+        class_weights: Optional weights for each class to handle imbalance.
     """
 
-    def __init__(self, root: str, files: List[str], log_dir: Optional[str] = None):
+    def __init__(self, root: str, files: List[str], class_weights: Optional[Dict[int, float]] = None):
         """Initialize the MEG dataset.
 
         Args:
             root: Root directory containing the processed data.
             files: List of filenames to use.
-            log_dir: Optional directory for log files. If None, logs to console only.
+            class_weights: Optional dictionary mapping class indices to weights.
         """
         self.root = root
         self.files = files
-        self.logger = logging.getLogger(__name__ + ".MEGDataset")
-        
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "meg_dataset.log"))
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(file_handler)
-        
-        self.logger.info(f"Initialized MEGDataset with {len(files)} files from {root}")
+        self.class_weights = class_weights
+        self.custom_logger = logging.getLogger(__name__)
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset.
@@ -60,11 +53,19 @@ class MEGDataset(torch.utils.data.Dataset):
         # Load MEG data of shape (n_channels, sample_length)
         file_path = Path(self.root, self.files[idx])
         try:
-            sample = torch.load(file_path)
-            return sample['data'], sample['label']
+            sample = torch.load(file_path, weights_only=False)
+            
+            # Check if required keys exist in the sample
+            if 'data' not in sample or 'label' not in sample:
+                self.custom_logger.warning(f"File {file_path} missing required keys. Found keys: {sample.keys()}")
+                data, label = None, None
+            else:
+                data, label = sample['data'], sample['label']
+            return data, label
+            
         except Exception as e:
-            self.logger.error(f"Error loading file {file_path}: {str(e)}")
-            raise
+            self.custom_logger.error(f"Error loading file {file_path}: {str(e)}")
+            return None, None
 
 
 class TUABLoader(torch.utils.data.Dataset):

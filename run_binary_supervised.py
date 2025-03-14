@@ -23,7 +23,8 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss
+from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
+torch.set_float32_matmul_precision('high') # Take advantage of tensor cores (trade off between speed and precision)
 
 
 class LitModel_finetune(pl.LightningModule):
@@ -57,7 +58,8 @@ class LitModel_finetune(pl.LightningModule):
         """
         X, y = batch
         prob = self.model(X)
-        loss = focal_loss(prob, y)
+        #loss = focal_loss(prob, y)
+        loss = BCE(prob, y)
         self.log("train_loss", loss)
         return loss
 
