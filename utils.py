@@ -875,7 +875,7 @@ def collate_fn_supervised_pretrain(batch):
     )
 
 
-def focal_loss(y_hat: torch.Tensor, y: torch.Tensor, alpha: float = 0.8, gamma: float = 0.7) -> torch.Tensor:
+def focal_loss(y_hat: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
     """Calculate focal loss for binary classification.
     
     Focal loss puts more weight on hard, misclassified examples.
@@ -896,6 +896,62 @@ def focal_loss(y_hat: torch.Tensor, y: torch.Tensor, alpha: float = 0.8, gamma: 
         1 - y
     ) * torch.log(1 - p)
     return loss.mean()
+
+
+def focal_loss_with_class_weights(y_hat: torch.Tensor, y: torch.Tensor, 
+                                 class_weights: Dict[int, float],
+                                 gamma: float = 2.0) -> torch.Tensor:
+    """Enhanced focal loss that uses class-specific weights.
+    
+    Args:
+        y_hat: Predicted values (N, 1)
+        y: True values (N, 1)
+        class_weights: Dictionary mapping class indices to weights
+        gamma: Focusing parameter (≥ 0)
+        
+    Returns:
+        Calculated focal loss with class weights
+    """
+    y_hat = y_hat.view(-1, 1)
+    y = y.view(-1, 1)
+    p = torch.sigmoid(y_hat)
+    
+    # Apply class-specific weights
+    weights = torch.ones_like(y, dtype=torch.float32)
+    weights[y == 0] = class_weights[0]  # Weight for non-spike class
+    weights[y == 1] = class_weights[1]  # Weight for spike class
+    
+    # Standard focal loss formula with per-sample weights
+    pt = p * y + (1 - p) * (1 - y)  # Get p_t for correct class
+    focal_weight = (1 - pt) ** gamma
+    
+    # Apply both class weights and focal weights
+    loss = -weights * focal_weight * torch.log(pt + 1e-12)  # Add epsilon for stability
+    
+    return loss.mean()
+
+
+def weighted_BCE(y_hat: torch.Tensor, y: torch.Tensor, class_weights: Dict[int, float]) -> torch.Tensor:
+    """Calculate weighted binary cross-entropy loss."""
+    y_hat = y_hat.view(-1, 1)
+    y = y.view(-1, 1)
+    
+    # Apply different weights based on class
+    weights = torch.ones_like(y, dtype=torch.float32)
+    weights[y == 0] = class_weights[0]  # Weight for non-spike samples
+    weights[y == 1] = class_weights[1]  # Weight for spike samples
+    
+    # Classical BCE calculation
+    bce_loss = (
+        -y * y_hat
+        + torch.log(1 + torch.exp(-torch.abs(y_hat)))
+        + torch.max(y_hat, torch.zeros_like(y_hat))
+    )
+    
+    # Apply weights
+    weighted_loss = weights * bce_loss
+    
+    return weighted_loss.mean()
 
 
 def BCE(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

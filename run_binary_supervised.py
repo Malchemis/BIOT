@@ -23,8 +23,7 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
-torch.set_float32_matmul_precision('high') # Take advantage of tensor cores (trade off between speed and precision)
+from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, focal_loss_with_class_weights, BCE, weighted_BCE
 
 
 class LitModel_finetune(pl.LightningModule):
@@ -58,8 +57,18 @@ class LitModel_finetune(pl.LightningModule):
         """
         X, y = batch
         prob = self.model(X)
-        #loss = focal_loss(prob, y)
+        
+        # Option 1: Original BCE loss (no weighting)
         loss = BCE(prob, y)
+        
+        # Option 2: Weighted BCE with class-specific weights
+        # loss = weighted_BCE(prob, y, self.class_weights)
+        
+        # Option 3: Original focal loss
+        # loss = focal_loss(prob, y, gamma=2.0)
+        
+        # Option 4: Focal loss with class weights
+        # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
         self.log("train_loss", loss)
         return loss
 
@@ -96,7 +105,7 @@ class LitModel_finetune(pl.LightningModule):
             gt = np.append(gt, out[1])
 
         if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
-            self.threshold = np.sort(result)[-int(np.sum(gt))]
+            self.threshold = np.sort(result)[-int(np.sum(gt))] # threshold 
             result = binary_metrics_fn(
                 gt,
                 result,
@@ -259,6 +268,16 @@ def prepare_custom_dataloader(args):
         worker_init_fn=seed_worker
     )
     logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
+    # test each loader to get a batch
+    for _, (X, y) in enumerate(train_loader):
+        logger.info(f"Train loader: {X.shape}, {y.shape}")
+        break
+    for _, (X, y) in enumerate(val_loader):
+        logger.info(f"Val loader: {X.shape}, {y.shape}")
+        break
+    for _, (X, y) in enumerate(test_loader):
+        logger.info(f"Test loader: {X.shape}, {y.shape}")
+        break
     return train_loader, test_loader, val_loader
 
 
