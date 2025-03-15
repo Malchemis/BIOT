@@ -5,11 +5,16 @@ import pickle
 import torch
 import logging
 import yaml
+import time
+import json
+import re
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Any, Union
 from tqdm import tqdm
 from collections import defaultdict
-import re
+import matplotlib.pyplot as plt
+import multiprocessing as mp
+import warnings
 
 from mne_interpolate import interpolate_missing_channels
 
@@ -24,20 +29,57 @@ class MEGDataset(torch.utils.data.Dataset):
         root: Root directory containing the processed data.
         files: List of filenames to use.
         class_weights: Optional weights for each class to handle imbalance.
+        cache_size: Number of samples to cache in memory (0 for no caching).
+        metadata_only: If True, only load metadata without loading full tensors.
     """
 
-    def __init__(self, root: str, files: List[str], class_weights: Optional[Dict[int, float]] = None):
+    def __init__(self, 
+                 root: str, 
+                 files: List[str], 
+                 class_weights: Optional[Dict[int, float]] = None,
+                 cache_size: int = 0,
+                 metadata_only: bool = False):
         """Initialize the MEG dataset.
 
         Args:
             root: Root directory containing the processed data.
             files: List of filenames to use.
             class_weights: Optional dictionary mapping class indices to weights.
+            cache_size: Number of samples to cache in memory (0 for no caching).
+            metadata_only: If True, only load metadata without loading full tensors.
         """
         self.root = root
         self.files = files
         self.class_weights = class_weights
+        self.cache_size = cache_size
+        self.metadata_only = metadata_only
         self.custom_logger = logging.getLogger(__name__)
+        
+        # Initialize cache
+        self.cache = {}
+        self.cache_keys = []
+        
+        # Preload metadata if requested
+        self.metadata = {}
+        if self.metadata_only:
+            self.preload_metadata()
+
+    def preload_metadata(self) -> None:
+        """Preload metadata for all files to enable efficient querying."""
+        self.custom_logger.info(f"Preloading metadata for {len(self.files)} files...")
+        for idx, filename in enumerate(tqdm(self.files, desc="Loading metadata")):
+            file_path = Path(self.root, filename)
+            try:
+                # Use torch.load with map_location='cpu' for better compatibility
+                sample = torch.load(file_path, map_location='cpu')
+                # Extract only metadata (exclude large tensors)
+                meta = {k: v for k, v in sample.items() if k != 'data'}
+                self.metadata[idx] = meta
+            except Exception as e:
+                self.custom_logger.warning(f"Error loading metadata for {file_path}: {str(e)}")
+                self.metadata[idx] = None
+                
+        self.custom_logger.info(f"Metadata preloaded for {len(self.metadata)} files")
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset.
@@ -47,31 +89,136 @@ class MEGDataset(torch.utils.data.Dataset):
         """
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Get a sample from the dataset.
 
         Args:
             idx: Index of the sample to retrieve.
 
         Returns:
-            Tuple containing the MEG data and its label.
+            Tuple containing the MEG data and its label (and optionally weight).
         """
-        # Load MEG data of shape (n_channels, sample_length)
-        file_path = Path(self.root, self.files[idx])
-        try:
-            sample = torch.load(file_path, weights_only=False)
-            
-            # Check if required keys exist in the sample
-            if 'data' not in sample or 'label' not in sample:
-                self.custom_logger.warning(f"File {file_path} missing required keys. Found keys: {sample.keys()}")
-                data, label = None, None
-            else:
-                data, label = sample['data'], sample['label']
-            return data, label
-            
-        except Exception as e:
-            self.custom_logger.error(f"Error loading file {file_path}: {str(e)}")
-            return None, None
+        # Check cache first
+        if idx in self.cache:
+            sample = self.cache[idx]
+        else:
+            # Load MEG data
+            file_path = Path(self.root, self.files[idx])
+            try:
+                # Use torch.load with map_location='cpu' for better compatibility
+                sample = torch.load(file_path, map_location='cpu')
+                
+                # Check if required keys exist in the sample
+                if 'data' not in sample or 'label' not in sample:
+                    self.custom_logger.warning(f"File {file_path} missing required keys. Found keys: {sample.keys()}")
+                    # Return zero tensors as fallback
+                    return torch.zeros((1, 100)), torch.tensor(0)
+                
+                # Update cache if enabled
+                if self.cache_size > 0:
+                    self._update_cache(idx, sample)
+                    
+            except Exception as e:
+                self.custom_logger.error(f"Error loading file {file_path}: {str(e)}")
+                # Return zero tensors as fallback
+                return torch.zeros((1, 100)), torch.tensor(0)
+        
+        data, label = sample['data'], sample['label']
+        
+        # If class weights are provided, return weight as well
+        if self.class_weights is not None:
+            label_value = label.item()
+            weight = torch.tensor(self.class_weights.get(label_value, 1.0), dtype=torch.float32)
+            return data, label, weight
+        
+        return data, label
+
+    def _update_cache(self, idx: int, sample: Dict[str, torch.Tensor]) -> None:
+        """Update the sample cache using LRU strategy.
+
+        Args:
+            idx: Index of the sample.
+            sample: Sample data.
+        """
+        # Add to cache
+        self.cache[idx] = sample
+        self.cache_keys.append(idx)
+        
+        # Remove oldest if exceeding cache size
+        if len(self.cache) > self.cache_size:
+            oldest_idx = self.cache_keys.pop(0)
+            del self.cache[oldest_idx]
+
+    def get_patient_ids(self) -> List[str]:
+        """Get list of unique patient IDs in the dataset.
+
+        Returns:
+            List of unique patient IDs.
+        """
+        if self.metadata_only and self.metadata:
+            patient_ids = set()
+            for meta in self.metadata.values():
+                if meta and 'patient_id' in meta:
+                    patient_ids.add(meta['patient_id'])
+            return sorted(list(patient_ids))
+        
+        # Fall back to loading from files
+        patient_ids = set()
+        for idx in range(len(self)):
+            file_path = Path(self.root, self.files[idx])
+            try:
+                sample = torch.load(file_path, map_location='cpu')
+                if 'patient_id' in sample:
+                    patient_ids.add(sample['patient_id'])
+            except Exception:
+                pass
+        return sorted(list(patient_ids))
+
+    def get_class_distribution(self) -> Dict[int, int]:
+        """Get distribution of classes in the dataset.
+
+        Returns:
+            Dictionary mapping class labels to counts.
+        """
+        if self.metadata_only and self.metadata:
+            distribution = defaultdict(int)
+            for meta in self.metadata.values():
+                if meta and 'label' in meta:
+                    label = meta['label'].item()
+                    distribution[label] += 1
+            return dict(distribution)
+        
+        # Fall back to loading from files
+        distribution = defaultdict(int)
+        for idx in tqdm(range(len(self)), desc="Calculating class distribution"):
+            _, label = self[idx]
+            distribution[label.item()] += 1
+        return dict(distribution)
+
+    def get_samples_by_patient(self, patient_id: str) -> List[int]:
+        """Get indices of samples belonging to a specific patient.
+
+        Args:
+            patient_id: ID of the patient.
+
+        Returns:
+            List of sample indices.
+        """
+        if self.metadata_only and self.metadata:
+            return [idx for idx, meta in self.metadata.items() 
+                   if meta and 'patient_id' in meta and meta['patient_id'] == patient_id]
+        
+        # Fall back to loading from files
+        indices = []
+        for idx in range(len(self)):
+            file_path = Path(self.root, self.files[idx])
+            try:
+                sample = torch.load(file_path, map_location='cpu')
+                if sample.get('patient_id') == patient_id:
+                    indices.append(idx)
+            except Exception:
+                pass
+        return indices
 
     @classmethod
     def calculate_class_weights(cls, files_list: List[str], root_dir: str) -> Dict[int, float]:
@@ -91,7 +238,7 @@ class MEGDataset(torch.utils.data.Dataset):
         for file_path in tqdm(files_list, desc="Calculating class weights"):
             full_path = os.path.join(root_dir, file_path)
             try:
-                sample = torch.load(full_path, weights_only=False)
+                sample = torch.load(full_path, map_location='cpu')
                 label = sample['label'].item()
                 class_counts[label] += 1
             except Exception as e:
@@ -107,6 +254,58 @@ class MEGDataset(torch.utils.data.Dataset):
         
         custom_logger.info(f"Calculated class weights: {class_weights}")
         return class_weights
+
+    @classmethod
+    def from_processed_dir(cls, processed_dir: str, split: str = 'train', 
+                          use_weights: bool = True, cache_size: int = 0,
+                          metadata_only: bool = False) -> 'MEGDataset':
+        """Create a dataset from a processed directory.
+
+        Args:
+            processed_dir: Path to the processed data directory.
+            split: Data split to use ('train', 'val', or 'test').
+            use_weights: Whether to use class weights.
+            cache_size: Number of samples to cache in memory.
+            metadata_only: Whether to only load metadata.
+
+        Returns:
+            Configured MEGDataset instance.
+
+        Raises:
+            FileNotFoundError: If the file list for the specified split is not found.
+        """
+        custom_logger = logging.getLogger(__name__)
+        
+        # Load file list
+        file_list_path = os.path.join(processed_dir, f"{split}_files.pkl")
+        if not os.path.exists(file_list_path):
+            raise FileNotFoundError(f"File list not found at {file_list_path}")
+            
+        with open(file_list_path, 'rb') as f:
+            files_list = pickle.load(f)
+            
+        custom_logger.info(f"Loaded {len(files_list)} files for {split} split")
+        
+        # Load class weights if requested
+        class_weights = None
+        if use_weights:
+            weights_path = os.path.join(processed_dir, "class_weights.pkl")
+            if os.path.exists(weights_path):
+                with open(weights_path, 'rb') as f:
+                    all_weights = pickle.load(f)
+                class_weights = all_weights.get(split)
+                custom_logger.info(f"Loaded class weights for {split}: {class_weights}")
+            else:
+                custom_logger.warning(f"Class weights file not found at {weights_path}")
+                
+        # Create dataset
+        return cls(
+            root=os.path.join(processed_dir, split),
+            files=files_list,
+            class_weights=class_weights,
+            cache_size=cache_size,
+            metadata_only=metadata_only
+        )
 
 
 class MEGPreprocessor:
@@ -137,13 +336,18 @@ class MEGPreprocessor:
         val_ratio: Ratio of patients to use for validation.
         random_state: Random seed for reproducibility.
         min_spikes_per_file: Minimum number of spikes required to process a file.
+        process_no_spike_files: Whether to process files with no valid spikes (for control data).
         skip_files: List of filenames to skip during processing.
         target_class_ratio: Target ratio of spike to non-spike samples.
         balance_method: Method to use for balancing classes.
-        augmentation: Configuration for time-domain augmentation.
+        augmentation: Configuration for augmentation.
         normalization: Configuration for signal normalization.
         n_jobs: Number of parallel jobs to use.
         max_segments_per_file: Maximum number of segments to extract per file.
+        online_saving: Whether to save segments immediately after processing.
+        annotation_rules: Rules for extracting spike annotations.
+        benchmark: Whether to collect timing statistics.
+        channel_stats: Whether to collect channel statistics.
     """
 
     def __init__(
@@ -162,6 +366,7 @@ class MEGPreprocessor:
             val_ratio: float = 0.2,
             random_state: int = 42,
             min_spikes_per_file: int = 10,
+            process_no_spike_files: bool = False,
             skip_files: List[str] = None,
             target_class_ratio: float = 0.5,            # 0.5 means balanced 1:1 ratio
             balance_method: str = 'undersample',        # 'undersample', 'oversample', or 'none'
@@ -169,6 +374,10 @@ class MEGPreprocessor:
             normalization: Dict[str, Any] = None,
             n_jobs: int = 1,
             max_segments_per_file: int = None,          # Maximum number of segments to extract per file
+            online_saving: bool = True,                 # Save segments immediately after processing
+            annotation_rules: Optional[Dict[str, Any]] = None,  # Rules for spike annotation extraction
+            benchmark: bool = True,                     # Collect timing statistics
+            channel_stats: bool = True,                 # Collect channel statistics
             logger: Optional[logging.Logger] = None
     ):
         """Initialize the MEG preprocessor.
@@ -188,17 +397,23 @@ class MEGPreprocessor:
             val_ratio: Ratio of patients to use for validation.
             random_state: Random seed for reproducibility.
             min_spikes_per_file: Minimum number of spikes required to process a file.
+            process_no_spike_files: Whether to process files with no valid spikes.
             skip_files: List of filenames or patterns to skip during processing.
             target_class_ratio: Target ratio of spike to non-spike segments (0.5 means balanced).
             balance_method: Method to use for balancing classes ('undersample', 'oversample', 'none').
-            augmentation: Configuration for time-domain augmentation.
+            augmentation: Configuration for augmentation.
             normalization: Configuration for signal normalization.
             n_jobs: Number of parallel jobs to use.
             max_segments_per_file: Maximum number of segments to extract per file.
+            online_saving: Whether to save segments immediately after processing.
+            annotation_rules: Rules for extracting spike annotations.
+            benchmark: Whether to collect timing statistics.
+            channel_stats: Whether to collect channel statistics.
             logger: Logger instance for this class.
 
         Raises:
             ValueError: If the overlap is invalid or if the split ratios don't sum to 1.
+            FileNotFoundError: If the good channels or channel locations files are not found.
         """
         self.root_dir = root_dir
         self.output_dir = output_dir
@@ -212,31 +427,15 @@ class MEGPreprocessor:
         self.val_ratio = val_ratio
         self.random_state = random_state
         self.min_spikes_per_file = min_spikes_per_file
+        self.process_no_spike_files = process_no_spike_files
         self.skip_files = skip_files or []
         self.target_class_ratio = target_class_ratio
         self.balance_method = balance_method
         self.n_jobs = n_jobs
         self.max_segments_per_file = max_segments_per_file
-
-        # Default augmentation settings
-        self.augmentation = {
-            'enabled': False,
-            'time_shift_ms': 50,        # Maximum time shift in milliseconds
-            'max_shifts': 2,            # Number of shifts to generate per spike
-            'preserve_spikes': True,    # Ensure spikes remain visible after shifting
-        }
-        if augmentation:
-            self.augmentation.update(augmentation)
-
-        # Default normalization settings
-        self.normalization = {
-            'method': 'percentile',  # 'percentile', 'zscore', 'minmax'
-            'percentile': 95,        # If using percentile method
-            'per_channel': True,     # Apply normalization per channel
-            'per_segment': False,    # Apply normalization per segment instead of whole recording
-        }
-        if normalization:
-            self.normalization.update(normalization)
+        self.online_saving = online_saving
+        self.benchmark = benchmark
+        self.channel_stats = channel_stats
 
         # Set up logging
         self.logger = logger or logging.getLogger(__name__)
@@ -257,15 +456,86 @@ class MEGPreprocessor:
             self.logger.error(error_msg)
             raise ValueError(error_msg)
 
+        # Validate augmentation parameters if provided
+        if augmentation and augmentation.get('enabled', False):
+            self._validate_augmentation_params(augmentation)
+
+        # Default augmentation settings
+        self.augmentation = {
+            'enabled': False,
+            'time_shift_ms': 50,        # Maximum time shift in milliseconds
+            'max_shifts': 2,            # Number of shifts to generate per spike
+            'preserve_spikes': True,    # Ensure spikes remain visible after shifting
+            'amplitude_scale': False,   # Whether to scale amplitude
+            'amplitude_range': (0.8, 1.2),  # Range for amplitude scaling
+            'add_noise': False,         # Whether to add noise
+            'noise_level': 0.05,        # Level of noise to add (relative to signal std)
+            'channel_dropout': False,   # Whether to randomly zero out channels
+            'channel_dropout_rate': 0.1 # Fraction of channels to zero out
+        }
+        if augmentation:
+            self.augmentation.update(augmentation)
+
+        # Default normalization settings
+        self.normalization = {
+            'method': 'percentile',  # 'percentile', 'zscore', 'minmax'
+            'percentile': 95,        # If using percentile method
+            'per_channel': True,     # Apply normalization per channel
+            'per_segment': False,    # Apply normalization per segment instead of whole recording
+        }
+        if normalization:
+            self.normalization.update(normalization)
+            
+        # Default annotation rules (can be overridden)
+        self.default_annotation_rules = {
+            'Holdout': {
+                'include': ['jj_add', 'JJ_add', 'jj_valid', 'JJ_valid'],
+                'exclude': []
+            },
+            'IterativeLearningFeedback1': {
+                'include': [],
+                'exclude': ['detected_spike']
+            },
+            'IterativeLearningFeedback2': {
+                'include': [],
+                'exclude': ['detected_spike']
+            },
+            'Default': {  # For ILF3-9 and others
+                'include': [],
+                'exclude': ['true_spike', 'detected_spike']
+            }
+        }
+        
+        # Override default rules if provided
+        self.annotation_rules = self.default_annotation_rules
+        if annotation_rules:
+            for group, rules in annotation_rules.items():
+                if group in self.annotation_rules:
+                    self.annotation_rules[group].update(rules)
+                else:
+                    self.annotation_rules[group] = rules
+
         # Load the list of good channels
+        if not os.path.exists(good_channels_file_path):
+            raise FileNotFoundError(f"Good channels file not found: {good_channels_file_path}")
+            
         self.logger.info(f"Loading good channels from {good_channels_file_path}")
-        with open(good_channels_file_path, 'rb') as f:
-            self.good_channels = pickle.load(f)
+        try:
+            with open(good_channels_file_path, 'rb') as f:
+                self.good_channels = pickle.load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to load good channels: {str(e)}")
 
         # Load the channel locations
+        if not os.path.exists(loc_meg_channels_file_path):
+            raise FileNotFoundError(f"Channel locations file not found: {loc_meg_channels_file_path}")
+            
         self.logger.info(f"Loading channel locations from {loc_meg_channels_file_path}")
-        with open(loc_meg_channels_file_path, 'rb') as f:
-            self.loc_meg_channels = pickle.load(f)
+        try:
+            with open(loc_meg_channels_file_path, 'rb') as f:
+                self.loc_meg_channels = pickle.load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to load channel locations: {str(e)}")
 
         # Create output directories
         for split in ['train', 'val', 'test']:
@@ -297,9 +567,71 @@ class MEGPreprocessor:
                 'skipped_files': 0,
                 'skipped_low_spikes': 0,
                 'skipped_pattern': 0,
+                'no_spike_files_processed': 0,
                 'augmented_segments': 0,
             }
         }
+        
+        # For benchmarking
+        if self.benchmark:
+            self.timing_stats = {
+                'per_file': {},
+                'total_time': 0,
+                'file_count': 0,
+                'segment_count': 0
+            }
+            
+        # For channel statistics
+        if self.channel_stats:
+            self.channels_info = {
+                'correlation_with_spikes': {},  # Channel correlation with spike presence
+                'variance_during_spikes': {},   # Channel variance during spikes
+                'most_informative': [],         # Ranked list of most informative channels
+                'per_patient': {}               # Per-patient statistics
+            }
+
+    def _validate_augmentation_params(self, augmentation: Dict[str, Any]) -> None:
+        """Validate augmentation parameters against clip length.
+
+        Args:
+            augmentation: Augmentation configuration dictionary.
+
+        Raises:
+            ValueError: If augmentation parameters are invalid.
+        """
+        if not augmentation.get('enabled', False):
+            return
+            
+        time_shift_ms = augmentation.get('time_shift_ms', 50)
+        max_shifts = augmentation.get('max_shifts', 2)
+        
+        # Check if time shift is too large for clip length
+        max_shift_samples = int(time_shift_ms * self.sampling_rate / 1000)
+        if max_shift_samples >= self.clip_length_samples // 2:
+            warning_msg = (
+                f"Warning: time_shift_ms ({time_shift_ms}ms) is too large for the clip length "
+                f"({self.clip_length_s * 1000}ms). This may shift spikes out of the segment. "
+                f"Consider reducing to at most {self.clip_length_s * 500}ms."
+            )
+            self.logger.warning(warning_msg)
+            warnings.warn(warning_msg)
+            
+        # Check if max_shifts is too large
+        if max_shifts > 3:
+            warning_msg = (
+                f"Warning: max_shifts ({max_shifts}) is quite high and might create redundant data. "
+                f"Consider reducing to 2-3 shifts per spike segment."
+            )
+            self.logger.warning(warning_msg)
+            warnings.warn(warning_msg)
+            
+        # Estimate resulting dataset size after augmentation
+        approx_increase = max_shifts
+        warning_msg = (
+            f"Augmentation will increase dataset size by approximately {approx_increase}x "
+            f"for spike segments."
+        )
+        self.logger.info(warning_msg)
 
     def _get_config_dict(self) -> Dict[str, Any]:
         """Create a dictionary of configuration parameters for metadata.
@@ -315,10 +647,13 @@ class MEGPreprocessor:
             'h_freq': self.h_freq,
             'notch_freq': self.notch_freq,
             'min_spikes_per_file': self.min_spikes_per_file,
+            'process_no_spike_files': self.process_no_spike_files,
             'target_class_ratio': self.target_class_ratio,
             'balance_method': self.balance_method,
             'augmentation': self.augmentation,
-            'normalization': self.normalization
+            'normalization': self.normalization,
+            'annotation_rules': self.annotation_rules,
+            'online_saving': self.online_saving
         }
 
     def _should_skip_file(self, file_path: str) -> bool:
@@ -457,7 +792,7 @@ class MEGPreprocessor:
         return {'train': train_patients, 'val': val_patients, 'test': test_patients}
 
     def _get_spike_annotations(self, annotations, group: str) -> List[float]:
-        """Extract spike annotations based on the group's rules.
+        """Extract spike annotations based on the group's annotation rules.
 
         Args:
             annotations: The MNE annotations object
@@ -473,6 +808,20 @@ class MEGPreprocessor:
         descriptions = annotations.description
         onsets = annotations.onset
         
+        # Determine which rules to use
+        if group in self.annotation_rules:
+            rules = self.annotation_rules[group]
+        else:
+            # Use default rules
+            rules = self.annotation_rules['Default']
+            
+        include_patterns = rules.get('include', [])
+        exclude_patterns = rules.get('exclude', [])
+        
+        # Compile patterns for faster matching
+        include_regex = [re.compile(pattern.lower()) for pattern in include_patterns]
+        exclude_regex = [re.compile(pattern.lower()) for pattern in exclude_patterns]
+        
         for i in range(len(annotations)):
             description = descriptions[i].lower()
             onset = onsets[i]
@@ -487,24 +836,28 @@ class MEGPreprocessor:
             if duplicate:
                 continue
                 
-            # Different rules based on group
-            if group == 'Holdout':
-                # For Holdout: only ["jj_add","JJ_add","jj_valid","JJ_valid"]
-                if "jj" in description.lower():
-                    spike_onsets.append(onset)
-                    seen_onsets.add(onset)
-            
-            elif group.startswith('IterativeLearningFeedback1') or group.startswith('IterativeLearningFeedback2'):
-                # For ILF1-2: 'spike' but not 'detected_spike'
-                if 'detected_spike' not in description:
-                    spike_onsets.append(onset)
-                    seen_onsets.add(onset)
-            
+            # Check if description matches include patterns
+            included = False
+            # if there is no include pattern, include all
+            if len(include_regex) == 0:
+                included = True
             else:
-                # For ILF3-9: 'spike' and 'jj' but not ['true_spike', 'detected_spike']
-                if ('true_spike' not in description and 'detected_spike' not in description):
-                    spike_onsets.append(onset)
-                    seen_onsets.add(onset)
+                for pattern in include_regex:
+                    if pattern.search(description):
+                        included = True
+                        break
+                    
+            # Check if description matches exclude patterns
+            excluded = False
+            for pattern in exclude_regex:
+                if pattern.search(description):
+                    excluded = True
+                    break
+                    
+            # Add onset if included and not excluded
+            if included and not excluded:
+                spike_onsets.append(onset)
+                seen_onsets.add(onset)
         
         return spike_onsets
 
@@ -555,10 +908,304 @@ class MEGPreprocessor:
             normalized = data
             
         return normalized
+        
+    def _calculate_channel_statistics(self, data: np.ndarray, labels: List[int], 
+                                      patient_id: str) -> Dict[str, Any]:
+        """Calculate channel statistics for spike detection.
+
+        Args:
+            data: MEG data array of shape (n_channels, n_samples)
+            labels: Labels for each segment (1 for spike, 0 for non-spike)
+            patient_id: ID of the patient
+
+        Returns:
+            Dictionary with channel statistics
+        """
+        if not self.channel_stats:
+            return {}
+            
+        try:
+            n_channels = data.shape[0]
+            
+            # Convert labels to numpy array and get spike/non-spike indices
+            label_array = np.array(labels)
+            spike_indices = np.where(label_array == 1)[0]
+            non_spike_indices = np.where(label_array == 0)[0]
+            
+            if len(spike_indices) == 0 or len(non_spike_indices) == 0:
+                return {}
+                
+            # Calculate correlation between each channel and spike presence
+            channel_correlations = {}
+            channel_variances = {}
+            
+            for ch_idx in range(n_channels):
+                # Calculate variance during spikes vs. non-spikes
+                if len(spike_indices) > 0:
+                    spike_variance = np.var(data[ch_idx, spike_indices])
+                    non_spike_variance = np.var(data[ch_idx, non_spike_indices])
+                    variance_ratio = spike_variance / (non_spike_variance + 1e-10)
+                    channel_variances[ch_idx] = variance_ratio
+                
+                # Calculate correlation with spike presence
+                # Use point-biserial correlation (correlation between continuous and binary variables)
+                # This is equivalent to Pearson correlation when one variable is binary
+                channel_data = data[ch_idx, :]
+                corr = np.corrcoef(channel_data, label_array)[0, 1]
+                channel_correlations[ch_idx] = corr
+            
+            # Store per-patient statistics
+            patient_stats = {
+                'correlations': channel_correlations,
+                'variances': channel_variances,
+                'n_segments': len(labels),
+                'n_spikes': len(spike_indices)
+            }
+            
+            # Update global statistics
+            if patient_id not in self.channels_info['per_patient']:
+                self.channels_info['per_patient'][patient_id] = patient_stats
+            else:
+                # Combine with existing statistics
+                existing = self.channels_info['per_patient'][patient_id]
+                n_total = existing['n_segments'] + patient_stats['n_segments']
+                
+                # Weighted average of correlations
+                for ch_idx in channel_correlations:
+                    if ch_idx in existing['correlations']:
+                        weight1 = existing['n_segments'] / n_total
+                        weight2 = patient_stats['n_segments'] / n_total
+                        existing['correlations'][ch_idx] = (
+                            weight1 * existing['correlations'][ch_idx] + 
+                            weight2 * patient_stats['correlations'][ch_idx]
+                        )
+                    else:
+                        existing['correlations'][ch_idx] = patient_stats['correlations'][ch_idx]
+                
+                # Update variance ratios
+                for ch_idx in channel_variances:
+                    if ch_idx in existing['variances']:
+                        weight1 = existing['n_segments'] / n_total
+                        weight2 = patient_stats['n_segments'] / n_total
+                        existing['variances'][ch_idx] = (
+                            weight1 * existing['variances'][ch_idx] + 
+                            weight2 * patient_stats['variances'][ch_idx]
+                        )
+                    else:
+                        existing['variances'][ch_idx] = patient_stats['variances'][ch_idx]
+                
+                # Update counts
+                existing['n_segments'] = n_total
+                existing['n_spikes'] += patient_stats['n_spikes']
+            
+            return patient_stats
+            
+        except Exception as e:
+            self.logger.warning(f"Error calculating channel statistics: {str(e)}")
+            return {}
+
+    def _update_channel_rankings(self) -> None:
+        """Update the ranking of most informative channels."""
+        if not self.channel_stats or not self.channels_info['per_patient']:
+            return
+            
+        # Aggregate correlations and variances across patients
+        all_correlations = defaultdict(list)
+        all_variances = defaultdict(list)
+        
+        for patient_id, stats in self.channels_info['per_patient'].items():
+            for ch_idx, corr in stats['correlations'].items():
+                all_correlations[ch_idx].append(corr)
+            for ch_idx, var_ratio in stats['variances'].items():
+                all_variances[ch_idx].append(var_ratio)
+        
+        # Calculate average correlation and variance ratio for each channel
+        avg_correlations = {}
+        avg_variances = {}
+        
+        for ch_idx in all_correlations:
+            avg_correlations[ch_idx] = np.mean(all_correlations[ch_idx])
+            
+        for ch_idx in all_variances:
+            avg_variances[ch_idx] = np.mean(all_variances[ch_idx])
+        
+        # Store in global statistics
+        self.channels_info['correlation_with_spikes'] = avg_correlations
+        self.channels_info['variance_during_spikes'] = avg_variances
+        
+        # Rank channels by correlation (absolute value)
+        channels_by_corr = sorted(
+            avg_correlations.items(), 
+            key=lambda x: abs(x[1]), 
+            reverse=True
+        )
+        
+        self.channels_info['most_informative'] = [
+            {'channel_idx': ch_idx, 'correlation': corr} 
+            for ch_idx, corr in channels_by_corr
+        ]
+
+    def _augment_segment(self, segment: np.ndarray, 
+                         augmentation_types: Optional[List[str]] = None) -> np.ndarray:
+        """Apply data augmentation to a segment.
+
+        Args:
+            segment: Segment data of shape (n_channels, n_samples)
+            augmentation_types: List of augmentation types to apply (default: all enabled types)
+
+        Returns:
+            Augmented segment
+        """
+        if not self.augmentation['enabled']:
+            return segment
+            
+        # Default: use all enabled augmentation types
+        if augmentation_types is None:
+            augmentation_types = []
+            if self.augmentation.get('amplitude_scale', False):
+                augmentation_types.append('amplitude_scale')
+            if self.augmentation.get('add_noise', False):
+                augmentation_types.append('add_noise')
+            if self.augmentation.get('channel_dropout', False):
+                augmentation_types.append('channel_dropout')
+        
+        # Make a copy to avoid modifying the original
+        augmented = segment.copy()
+        
+        # Apply selected augmentations
+        for aug_type in augmentation_types:
+            if aug_type == 'amplitude_scale' and self.augmentation.get('amplitude_scale', False):
+                # Scale amplitude
+                scale_range = self.augmentation.get('amplitude_range', (0.8, 1.2))
+                scale_factor = np.random.uniform(scale_range[0], scale_range[1])
+                augmented = augmented * scale_factor
+                
+            elif aug_type == 'add_noise' and self.augmentation.get('add_noise', False):
+                # Add Gaussian noise
+                noise_level = self.augmentation.get('noise_level', 0.05)
+                # Calculate standard deviation of the data for proportional noise
+                data_std = np.std(augmented)
+                noise = np.random.normal(0, noise_level * data_std, augmented.shape)
+                augmented = augmented + noise
+                
+            elif aug_type == 'channel_dropout' and self.augmentation.get('channel_dropout', False):
+                # Randomly zero out some channels
+                dropout_rate = self.augmentation.get('channel_dropout_rate', 0.1)
+                n_channels = augmented.shape[0]
+                n_dropout = int(n_channels * dropout_rate)
+                
+                if n_dropout > 0:
+                    # Select channels to drop
+                    drop_channels = np.random.choice(
+                        np.arange(n_channels), 
+                        n_dropout, 
+                        replace=False
+                    )
+                    augmented[drop_channels, :] = 0
+        
+        return augmented
+
+    def _save_data_examples(self) -> None:
+        """Generate and save example visualizations of processed data.
+        
+        Creates plots of random examples from each split to verify data quality.
+        """
+        if not self.processed_files['train'] and not self.processed_files['val'] and not self.processed_files['test']:
+            self.logger.warning("No data to visualize for sanity check")
+            return
+            
+        self.logger.info("Generating data example visualizations for sanity check...")
+        
+        # Create output directory for visualizations
+        viz_dir = os.path.join(self.output_dir, "visualizations")
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        # Sample a few examples from each split
+        examples_per_split = 2
+        for split in ['train', 'val', 'test']:
+            if not self.processed_files[split]:
+                continue
+                
+            # Get sample of files, prioritizing both spike and non-spike examples
+            split_dir = os.path.join(self.output_dir, split)
+            samples = []
+            spike_count = 0
+            non_spike_count = 0
+            
+            # Use random sampling with a large enough pool to ensure we get both classes
+            file_pool = np.random.choice(self.processed_files[split], 
+                                       min(50, len(self.processed_files[split])), 
+                                       replace=False)
+            
+            for file_name in file_pool:
+                if len(samples) >= examples_per_split:
+                    break
+                    
+                file_path = os.path.join(split_dir, file_name)
+                try:
+                    sample = torch.load(file_path, map_location='cpu')
+                    label = sample['label'].item()
+                    
+                    # Ensure we get at least one example of each class if available
+                    if label == 1 and spike_count < examples_per_split // 2:
+                        samples.append(sample)
+                        spike_count += 1
+                    elif label == 0 and non_spike_count < examples_per_split // 2:
+                        samples.append(sample)
+                        non_spike_count += 1
+                        
+                except Exception as e:
+                    self.logger.warning(f"Error loading sample for visualization: {e}")
+            
+            # Plot the examples
+            for i, sample in enumerate(samples):
+                try:
+                    # Extract data and metadata
+                    data = sample['data'].numpy()
+                    label = sample['label'].item()
+                    patient_id = sample.get('patient_id', 'unknown')
+                    has_spike = "spike" if label == 1 else "non-spike"
+                    
+                    # Create plot
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    
+                    # Plot multiple channels with different colors
+                    n_channels = min(10, data.shape[0])  # Limit to 10 channels for clarity
+                    time_axis = np.arange(data.shape[1]) / self.sampling_rate
+                    
+                    # Use a color cycle for multiple channels
+                    colors = plt.cm.tab10(np.linspace(0, 1, n_channels))
+                    
+                    for ch_idx in range(n_channels):
+                        ax.plot(time_axis, data[ch_idx] + ch_idx * 2, color=colors[ch_idx], 
+                               label=f"Channel {ch_idx}")
+                    
+                    # Highlight spike position if available
+                    if label == 1 and 'spike_position' in sample:
+                        spike_pos = sample['spike_position']
+                        spike_time = spike_pos / self.sampling_rate
+                        ax.axvline(x=spike_time, color='r', linestyle='--', 
+                                 label=f"Spike at {spike_time:.3f}s")
+                    
+                    # Add labels and title
+                    ax.set_xlabel('Time (s)')
+                    ax.set_ylabel('Amplitude (a.u.)')
+                    ax.set_title(f"{split.capitalize()} example: Patient {patient_id}, {has_spike}")
+                    
+                    # Save the figure
+                    fig_path = os.path.join(viz_dir, f"{split}_{i+1}_{has_spike}.png")
+                    plt.tight_layout()
+                    plt.savefig(fig_path)
+                    plt.close(fig)
+                    
+                except Exception as e:
+                    self.logger.warning(f"Error creating visualization: {e}")
+        
+        self.logger.info(f"Saved data example visualizations to {viz_dir}")
 
     def _create_time_shifted_segments(self, segment: np.ndarray, label: int, 
                                      start_position: int, spike_position: Optional[int] = None,
-                                     sampling_rate: int = None) -> List[Tuple[np.ndarray, int, int]]:
+                                     sampling_rate: int = None) -> List[Tuple[np.ndarray, int, int, Optional[int]]]:
         """Create time-shifted versions of a segment for data augmentation.
 
         Args:
@@ -569,7 +1216,7 @@ class MEGPreprocessor:
             sampling_rate: Sampling rate (defaults to self.sampling_rate)
 
         Returns:
-            List of tuples containing (augmented_segment, label, new_start_position)
+            List of tuples containing (augmented_segment, label, new_start_position, new_spike_position)
         """
         if not self.augmentation['enabled'] or label == 0:
             # No augmentation for non-spike segments or if augmentation is disabled
@@ -591,7 +1238,7 @@ class MEGPreprocessor:
                 np.arange(-max_shift_samples, 0),
                 np.arange(1, max_shift_samples + 1)
             ]),
-            size=max_shifts,
+            size=min(max_shifts, 2 * max_shift_samples),  # Can't have more shifts than possible positions
             replace=False
         )
         
@@ -608,6 +1255,7 @@ class MEGPreprocessor:
                 shifted_segment[:, :shift] = segment[:, -shift:]
                 
             # If we need to preserve spikes, check if spike is still visible
+            new_spike_pos = None
             if self.augmentation['preserve_spikes'] and spike_position is not None:
                 new_spike_pos = spike_position + shift
                 if new_spike_pos < 0 or new_spike_pos >= segment.shape[1]:
@@ -617,8 +1265,11 @@ class MEGPreprocessor:
             # Calculate new start position
             new_start_position = start_position - shift
             
+            # Apply additional augmentations
+            augmented_segment = self._augment_segment(shifted_segment)
+            
             # Add to results
-            augmented_segments.append((shifted_segment, label, new_start_position))
+            augmented_segments.append((augmented_segment, label, new_start_position, new_spike_pos))
             
         return augmented_segments
 
@@ -667,7 +1318,7 @@ class MEGPreprocessor:
                 target_spikes = int(n_non_spikes * self.target_class_ratio / (1 - self.target_class_ratio))
                 target_non_spikes = n_non_spikes
                 
-            # Randomly select indices
+            # Randomly select indices with stratified sampling
             np.random.seed(self.random_state)
             if target_spikes < n_spikes:
                 selected_spike_indices = np.random.choice(spike_indices, target_spikes, replace=False)
@@ -719,22 +1370,30 @@ class MEGPreprocessor:
                         
         return balanced_segments, balanced_labels, balanced_start_positions, balanced_spike_positions
     
-    def preprocess_file(self, file_info: Dict[str, str], interpolate: bool) -> Tuple[
+    def preprocess_file(self, file_info: Dict[str, str], interpolate: bool,
+                       save_immediately: bool = None) -> Tuple[
         Optional[List[np.ndarray]], Optional[List[int]], Optional[List[int]], Optional[List[Optional[int]]]]:
         """Preprocess a single .ds file.
 
         Args:
             file_info: Dictionary with file information
             interpolate: If True, interpolate missing channels. Else drops to keep only intersection of valid channels.
+            save_immediately: Whether to save segments immediately after processing. 
+                              If None, uses self.online_saving.
 
         Returns:
-            Tuple containing:
-            - segments: List of preprocessed segments
-            - labels: Labels for each segment (1 for spike, 0 for non-spike)
-            - start_positions: Original starting position of each segment in samples
-            - spike_positions: Position of the spike within each segment (None for non-spike segments)
+            If save_immediately is False:
+                Tuple containing:
+                - segments: List of preprocessed segments
+                - labels: Labels for each segment (1 for spike, 0 for non-spike)
+                - start_positions: Original starting position of each segment in samples
+                - spike_positions: Position of the spike within each segment (None for non-spike segments)
+            If save_immediately is True:
+                Returns (None, None, None, None) to indicate data was saved directly.
             Returns None for all values if processing fails.
         """
+        start_time = time.time()
+        
         file_path = file_info['path']
         patient_id = file_info['patient_id']
         group = file_info['group']
@@ -747,6 +1406,10 @@ class MEGPreprocessor:
         test_overlap = 0.0 if is_test_set else self.overlap
         
         self.logger.info(f"Processing {file_path} (split: {split}, group: {group})")
+
+        # Use save_immediately parameter if provided, otherwise use class setting
+        if save_immediately is None:
+            save_immediately = self.online_saving
 
         # Load the raw data
         try:
@@ -798,21 +1461,32 @@ class MEGPreprocessor:
         annotations = raw_file.annotations
         if len(annotations) == 0:
             self.logger.warning(f"No annotations found in {file_path}")
-            return None, None, None, None
-
-        # Extract spike annotations based on group rules
-        spike_onsets = self._get_spike_annotations(annotations, group)
-        
-        if len(spike_onsets) == 0:
-            self.logger.warning(f"No valid spike annotations found in {file_path} using rules for {group}")
-            return None, None, None, None
+            if self.process_no_spike_files:
+                self.logger.info(f"Processing {file_path} as control data (no spikes)")
+                # Process as control data (all segments as non-spikes)
+                spike_onsets = []
+                self.dataset_metadata['processing_stats']['no_spike_files_processed'] += 1
+            else:
+                return None, None, None, None
+        else:
+            # Extract spike annotations based on group rules
+            spike_onsets = self._get_spike_annotations(annotations, group)
             
-        # Check if file has enough spikes - don't filter test set files by spike count
-        if not is_test_set and len(spike_onsets) < self.min_spikes_per_file:
-            self.logger.warning(f"File {file_path} has only {len(spike_onsets)} spikes, which is below the minimum threshold of {self.min_spikes_per_file}")
-            self.dataset_metadata['processing_stats']['skipped_low_spikes'] += 1
-            return None, None, None, None
-            
+            if len(spike_onsets) == 0:
+                self.logger.warning(f"No valid spike annotations found in {file_path} using rules for {group}")
+                if self.process_no_spike_files:
+                    self.logger.info(f"Processing {file_path} as control data (no spikes)")
+                    # Process as control data (all segments as non-spikes)
+                    self.dataset_metadata['processing_stats']['no_spike_files_processed'] += 1
+                else:
+                    return None, None, None, None
+                
+            # Check if file has enough spikes - don't filter test set files by spike count
+            elif not is_test_set and len(spike_onsets) < self.min_spikes_per_file and not self.process_no_spike_files:
+                self.logger.warning(f"File {file_path} has only {len(spike_onsets)} spikes, which is below the minimum threshold of {self.min_spikes_per_file}")
+                self.dataset_metadata['processing_stats']['skipped_low_spikes'] += 1
+                return None, None, None, None
+                
         self.logger.info(f"Found {len(spike_onsets)} valid spike annotations in {file_path}")
 
         # Convert spike onsets from seconds to samples
@@ -825,6 +1499,7 @@ class MEGPreprocessor:
         labels = []
         start_positions = []  # Track the original starting position of each segment
         spike_positions = []  # Track the position of spikes within segments (for augmentation)
+        saved_files = []  # Track saved file paths if save_immediately is True
 
         # Use test-specific overlap value for test set
         current_overlap = test_overlap if is_test_set else self.overlap
@@ -835,6 +1510,13 @@ class MEGPreprocessor:
 
         # Cut the data into overlapping segments
         start_samples = range(0, n_samples - self.clip_length_samples + 1, step_size)
+        
+        # Track segments to process in this iteration
+        segments_batch = []
+        labels_batch = []
+        start_positions_batch = []
+        spike_positions_batch = []
+        
         for start in start_samples:
             end = start + self.clip_length_samples
             segment = meg_data[:, start:end]  # take the segment across channels
@@ -844,23 +1526,193 @@ class MEGPreprocessor:
                                       if start <= spike_onset < end]
             
             has_spike = len(segment_spike_positions) > 0
-            segments.append(segment)
-            labels.append(1 if has_spike else 0)
             
-            # Store spike position (None if no spike)
-            if has_spike:
-                # If multiple spikes, take the position of the first one
-                spike_positions.append(segment_spike_positions[0])
+            if save_immediately:
+                segments_batch.append(segment)
+                labels_batch.append(1 if has_spike else 0)
+                
+                # Store spike position (None if no spike)
+                if has_spike:
+                    # If multiple spikes, take the position of the first one
+                    spike_positions_batch.append(segment_spike_positions[0])
+                else:
+                    spike_positions_batch.append(None)
+    
+                # Store original position in samples (at original sampling rate)
+                original_start = int(
+                    start * original_sfreq / self.sampling_rate)  # convert back to original sampling rate
+                start_positions_batch.append(original_start)
+                
+                # Save batch if it gets large enough to avoid memory issues
+                if len(segments_batch) >= 1000:
+                    # Apply augmentation, balancing, etc.
+                    processed_batch = self._process_segment_batch(
+                        segments_batch, labels_batch, start_positions_batch, spike_positions_batch,
+                        file_info, split, is_test_set, original_sfreq
+                    )
+                    
+                    # Save the processed segments
+                    saved_batch = self._save_segment_batch(processed_batch, file_info, split)
+                    saved_files.extend(saved_batch)
+                    
+                    # Clear batch
+                    segments_batch = []
+                    labels_batch = []
+                    start_positions_batch = []
+                    spike_positions_batch = []
             else:
-                spike_positions.append(None)
+                segments.append(segment)
+                labels.append(1 if has_spike else 0)
+                
+                # Store spike position (None if no spike)
+                if has_spike:
+                    # If multiple spikes, take the position of the first one
+                    spike_positions.append(segment_spike_positions[0])
+                else:
+                    spike_positions.append(None)
+    
+                # Store original position in samples (at original sampling rate)
+                original_start = int(
+                    start * original_sfreq / self.sampling_rate)  # convert back to original sampling rate
+                start_positions.append(original_start)
 
-            # Store original position in samples (at original sampling rate)
-            original_start = int(
-                start * original_sfreq / self.sampling_rate)  # convert back to original sampling rate
-            start_positions.append(original_start)
-
-        self.logger.info(f"Created {len(segments)} segments, {sum(labels)} with spikes")
+        # Process any remaining segments in the batch
+        if save_immediately and segments_batch:
+            processed_batch = self._process_segment_batch(
+                segments_batch, labels_batch, start_positions_batch, spike_positions_batch,
+                file_info, split, is_test_set, original_sfreq
+            )
+            
+            # Save the processed segments
+            saved_batch = self._save_segment_batch(processed_batch, file_info, split)
+            saved_files.extend(saved_batch)
         
+        # Store timing statistics
+        end_time = time.time()
+        if self.benchmark:
+            file_duration = end_time - start_time
+            self.timing_stats['per_file'][file_path] = {
+                'duration_seconds': file_duration,
+                'n_segments': len(saved_files) if save_immediately else len(segments),
+                'seconds_per_segment': file_duration / (len(saved_files) if save_immediately else (len(segments) or 1))
+            }
+            self.timing_stats['total_time'] += file_duration
+            self.timing_stats['file_count'] += 1
+            self.timing_stats['segment_count'] += len(saved_files) if save_immediately else len(segments)
+
+        if save_immediately:
+            # Return the list of saved files for tracking
+            return None, None, None, None
+        else:
+            self.logger.info(f"Created {len(segments)} segments, {sum(labels)} with spikes")
+            
+            # Process segments (augmentation, balancing)
+            if len(segments) > 0:
+                original_segments = segments.copy()
+                
+                # Skip augmentation for test set
+                if self.augmentation['enabled'] and not is_test_set:
+                    augmented_segments = []
+                    augmented_labels = []
+                    augmented_start_positions = []
+                    augmented_spike_positions = []
+                    
+                    for i, (segment, label, start_pos, spike_pos) in enumerate(zip(segments, labels, start_positions, spike_positions)):
+                        # Only augment spike segments
+                        if label == 1:
+                            shifted_segments = self._create_time_shifted_segments(
+                                segment, label, start_pos, spike_pos, self.sampling_rate
+                            )
+                            
+                            for shifted_segment, shifted_label, shifted_start_pos, shifted_spike_pos in shifted_segments:
+                                augmented_segments.append(shifted_segment)
+                                augmented_labels.append(shifted_label)
+                                augmented_start_positions.append(shifted_start_pos)
+                                augmented_spike_positions.append(shifted_spike_pos)
+                    
+                    # Add augmented segments to the original ones
+                    if augmented_segments:
+                        self.logger.info(f"Added {len(augmented_segments)} augmented segments")
+                        segments.extend(augmented_segments)
+                        labels.extend(augmented_labels)
+                        start_positions.extend(augmented_start_positions)
+                        spike_positions.extend(augmented_spike_positions)
+                        
+                        # Update metadata
+                        self.dataset_metadata['processing_stats']['augmented_segments'] += len(augmented_segments)
+                
+                # Apply class balancing if enabled, but skip for test set
+                if self.balance_method != 'none' and not is_test_set:
+                    segments, labels, start_positions, spike_positions = self._balance_segments(
+                        segments, labels, start_positions, spike_positions
+                    )
+                    
+                # Limit the number of segments if configured, but don't limit test set
+                if self.max_segments_per_file and len(segments) > self.max_segments_per_file and not is_test_set:
+                    self.logger.info(f"Limiting {len(segments)} segments to {self.max_segments_per_file}")
+                    
+                    # Stratified sampling to maintain class distribution
+                    positive_indices = [i for i, label in enumerate(labels) if label == 1]
+                    negative_indices = [i for i, label in enumerate(labels) if label == 0]
+                    
+                    # Calculate how many of each class to keep
+                    n_positives = min(len(positive_indices), int(self.max_segments_per_file * sum(labels) / len(labels)))
+                    n_negatives = self.max_segments_per_file - n_positives
+                    
+                    # Select random samples from each class
+                    np.random.seed(self.random_state)
+                    selected_positives = np.random.choice(positive_indices, n_positives, replace=False)
+                    selected_negatives = np.random.choice(negative_indices, n_negatives, replace=False)
+                    
+                    # Combine and sort indices
+                    selected_indices = np.sort(np.concatenate([selected_positives, selected_negatives]))
+                    
+                    # Extract selected samples
+                    segments = [segments[i] for i in selected_indices]
+                    labels = [labels[i] for i in selected_indices]
+                    start_positions = [start_positions[i] for i in selected_indices]
+                    spike_positions = [spike_positions[i] for i in selected_indices]
+                
+                if self.channel_stats:
+                    # Calculate channel statistics using original (non-augmented) segments
+                    self._calculate_channel_statistics(
+                        np.array(original_segments), labels[:len(original_segments)], patient_id
+                    )
+                
+            self.logger.info(f"Final segment count: {len(segments)} ({sum(labels)} spikes, {len(labels) - sum(labels)} non-spikes)")
+            return segments, labels, start_positions, spike_positions
+
+    def _process_segment_batch(self, segments: List[np.ndarray], labels: List[int],
+                              start_positions: List[int], spike_positions: List[Optional[int]],
+                              file_info: Dict[str, str], split: str, is_test_set: bool,
+                              original_sfreq: float) -> Dict[str, Any]:
+        """Process a batch of segments.
+
+        Args:
+            segments: List of segment arrays
+            labels: List of segment labels
+            start_positions: List of starting positions
+            spike_positions: List of spike positions
+            file_info: Dictionary with file information
+            split: Data split ('train', 'val', or 'test')
+            is_test_set: Whether the file belongs to the test set
+            original_sfreq: Original sampling frequency
+
+        Returns:
+            Dictionary with processed segments, labels, etc.
+        """
+        if len(segments) == 0:
+            return {
+                'segments': [],
+                'labels': [],
+                'start_positions': [],
+                'spike_positions': [],
+                'augmented_flag': []
+            }
+            
+        # Keep track of which segments were created through augmentation
+        augmented_flag = [False] * len(segments)
+            
         # Skip augmentation for test set
         if self.augmentation['enabled'] and not is_test_set:
             augmented_segments = []
@@ -875,64 +1727,139 @@ class MEGPreprocessor:
                         segment, label, start_pos, spike_pos, self.sampling_rate
                     )
                     
-                    for shifted_segment, shifted_label, shifted_start_pos in shifted_segments:
+                    for shifted_segment, shifted_label, shifted_start_pos, shifted_spike_pos in shifted_segments:
                         augmented_segments.append(shifted_segment)
                         augmented_labels.append(shifted_label)
                         augmented_start_positions.append(shifted_start_pos)
-                        # Recalculate spike position or use None if not available
-                        if spike_pos is not None:
-                            # The spike position is shifted by the same amount as the segment
-                            shifted_spike_pos = spike_pos - (shifted_start_pos - start_pos)
-                            augmented_spike_positions.append(shifted_spike_pos)
-                        else:
-                            augmented_spike_positions.append(None)
-            
+                        augmented_spike_positions.append(shifted_spike_pos)
+                        
             # Add augmented segments to the original ones
             if augmented_segments:
-                self.logger.info(f"Added {len(augmented_segments)} augmented segments from time-domain shifts")
+                self.logger.debug(f"Added {len(augmented_segments)} augmented segments")
                 segments.extend(augmented_segments)
                 labels.extend(augmented_labels)
                 start_positions.extend(augmented_start_positions)
                 spike_positions.extend(augmented_spike_positions)
+                augmented_flag.extend([True] * len(augmented_segments))
                 
                 # Update metadata
                 self.dataset_metadata['processing_stats']['augmented_segments'] += len(augmented_segments)
         
         # Apply class balancing if enabled, but skip for test set
         if self.balance_method != 'none' and not is_test_set:
-            segments, labels, start_positions, spike_positions = self._balance_segments(
+            result = self._balance_segments(
                 segments, labels, start_positions, spike_positions
             )
+            segments, labels, start_positions, spike_positions = result
             
-        # Limit the number of segments if configured, but don't limit test set
-        if self.max_segments_per_file and len(segments) > self.max_segments_per_file and not is_test_set:
-            self.logger.info(f"Limiting {len(segments)} segments to {self.max_segments_per_file}")
-            
-            # Stratified sampling to maintain class distribution
-            positive_indices = [i for i, label in enumerate(labels) if label == 1]
-            negative_indices = [i for i, label in enumerate(labels) if label == 0]
-            
-            # Calculate how many of each class to keep
-            n_positives = min(len(positive_indices), int(self.max_segments_per_file * sum(labels) / len(labels)))
-            n_negatives = self.max_segments_per_file - n_positives
-            
-            # Select random samples from each class
-            np.random.seed(self.random_state)
-            selected_positives = np.random.choice(positive_indices, n_positives, replace=False)
-            selected_negatives = np.random.choice(negative_indices, n_negatives, replace=False)
-            
-            # Combine and sort indices
-            selected_indices = np.sort(np.concatenate([selected_positives, selected_negatives]))
-            
-            # Extract selected samples
-            segments = [segments[i] for i in selected_indices]
-            labels = [labels[i] for i in selected_indices]
-            start_positions = [start_positions[i] for i in selected_indices]
-            spike_positions = [spike_positions[i] for i in selected_indices]
-            
-        self.logger.info(f"Final segment count: {len(segments)} ({sum(labels)} spikes, {len(labels) - sum(labels)} non-spikes)")
-        return segments, labels, start_positions, spike_positions
+            # Need to update augmented_flag to match the new segment count
+            # This is approximate since we don't know exactly which segments were kept
+            if len(augmented_flag) != len(segments):
+                # If the length changed, we need to create a new array
+                n_original = len(augmented_flag)
+                n_new = len(segments)
+                
+                if n_new < n_original:
+                    # If we're undersampling, just keep the first n_new flags
+                    augmented_flag = augmented_flag[:n_new]
+                else:
+                    # If we're oversampling, use the original flags and add extras
+                    extra_flags = []
+                    for _ in range(n_new - n_original):
+                        # Assume new segments come from oversampling originals
+                        extra_flags.append(False)
+                    augmented_flag.extend(extra_flags)
+                    
+        return {
+            'segments': segments,
+            'labels': labels,
+            'start_positions': start_positions,
+            'spike_positions': spike_positions,
+            'augmented_flag': augmented_flag
+        }
 
+    def _save_segment_batch(self, batch: Dict[str, Any], file_info: Dict[str, str], 
+                           split: str) -> List[str]:
+        """Save a batch of processed segments to disk.
+
+        Args:
+            batch: Dictionary with segments, labels, etc.
+            file_info: Dictionary with file information
+            split: Data split ('train', 'val', or 'test')
+
+        Returns:
+            List of saved file paths
+        """
+        segments = batch['segments']
+        labels = batch['labels']
+        start_positions = batch['start_positions']
+        spike_positions = batch['spike_positions']
+        augmented_flag = batch['augmented_flag']
+        
+        if len(segments) == 0:
+            return []
+            
+        patient_id = file_info['patient_id']
+        filename_origin = file_info['filename'].split('.')[0]
+        group = file_info['group']
+        
+        # Determine if this is part of the test set
+        is_test_set = (split == 'test') or (group == 'Holdout')
+        
+        self.logger.debug(f"Saving {len(segments)} segments for patient {patient_id} to {split} split")
+        
+        saved_files = []
+
+        # Save each segment
+        for i in range(len(segments)):
+            file_prefix = f"{patient_id}_{filename_origin}_{i:04d}"  # i:04d formats the output to have 4 numbers like 0001, 0002,...
+            file_prefix = file_prefix.replace('__', '_')  # adding the origin might double the underscores
+            file_path = os.path.join(self.output_dir, split, f"{file_prefix}.pt")
+
+            # Tensor conversion
+            segment_tensor = torch.tensor(segments[i], dtype=torch.float32)
+            label_tensor = torch.tensor(labels[i], dtype=torch.long)
+            
+            # Extended metadata
+            metadata = {
+                'data': segment_tensor,
+                'label': label_tensor,
+                'patient_id': patient_id,
+                'original_filename': filename_origin,
+                'start_position': int(start_positions[i]),
+                'original_index': i,
+                'group': group,
+                # Additional metadata
+                'preprocessing_config': {
+                    'sampling_rate': self.sampling_rate,
+                    'l_freq': self.l_freq,
+                    'h_freq': self.h_freq,
+                    'notch_freq': self.notch_freq,
+                    'normalization': self.normalization['method'],
+                },
+                'segment_length_s': self.clip_length_s,
+                'segment_length_samples': self.clip_length_samples,
+                'is_test_set': is_test_set,
+            }
+            
+            # Add spike position metadata if available
+            if spike_positions[i] is not None:
+                metadata['spike_position'] = int(spike_positions[i])
+                metadata['spike_time'] = spike_positions[i] / self.sampling_rate
+                
+            # Add augmentation flag if applicable and not a test sample
+            if not is_test_set and i < len(augmented_flag) and augmented_flag[i]:
+                metadata['augmented'] = True
+
+            torch.save(metadata, file_path)
+            saved_files.append(f"{file_prefix}.pt")
+            
+            # Update class distribution statistics
+            self.dataset_metadata['class_distribution'][split][labels[i]] += 1
+
+        self.logger.debug(f"Saved {len(segments)} segments for patient {patient_id}")
+        return saved_files
+        
     def save_segments(self,
                       segments: List[np.ndarray],
                       labels: List[int],
@@ -1036,59 +1963,45 @@ class MEGPreprocessor:
             self.logger.info(f"Processing test set file: {file_info['path']} (minimal processing)")
         
         try:
-            # Process the file
+            # Process the file with immediate saving
             segments, labels, start_positions, spike_positions = self.preprocess_file(
-                file_info, interpolate=True
+                file_info, interpolate=True, save_immediately=True
             )
             
-            if segments and labels and start_positions:
-                # Save the processed segments
-                processed_files = []
+            # Since we're using immediate saving, we don't have segment information here
+            # Instead, collect segment info from already saved files
+            split_dir = os.path.join(self.output_dir, split)
+            prefix = f"{patient_id}_{file_info['filename'].split('.')[0]}"
+            prefix = prefix.replace('__', '_')
+            
+            processed_files = []
+            for filename in os.listdir(split_dir):
+                if filename.startswith(prefix) and filename.endswith('.pt'):
+                    processed_files.append(filename)
+                    
+            if processed_files:
+                # Count class distribution by loading label from each file
                 class_counts = {0: 0, 1: 0}
                 
-                for i in range(len(segments)):
-                    file_prefix = f"{patient_id}_{file_info['filename'].split('.')[0]}_{i:04d}"
-                    file_prefix = file_prefix.replace('__', '_')
-                    file_path = os.path.join(self.output_dir, split, f"{file_prefix}.pt")
-                    
-                    # Create metadata
-                    metadata = {
-                        'data': torch.tensor(segments[i], dtype=torch.float32),
-                        'label': torch.tensor(labels[i], dtype=torch.long),
-                        'patient_id': patient_id,
-                        'original_filename': file_info['filename'].split('.')[0],
-                        'start_position': int(start_positions[i]),
-                        'original_index': i,
-                        'group': group,
-                        'preprocessing_config': {
-                            'sampling_rate': self.sampling_rate,
-                            'l_freq': self.l_freq,
-                            'h_freq': self.h_freq,
-                            'notch_freq': self.notch_freq,
-                            'normalization': self.normalization['method'],
-                        },
-                        'segment_length_s': self.clip_length_s,
-                        'segment_length_samples': self.clip_length_samples,
-                        'is_test_set': is_test_set,
-                    }
-                    
-                    # Add spike position metadata if available
-                    if spike_positions[i] is not None:
-                        metadata['spike_position'] = int(spike_positions[i])
-                        metadata['spike_time'] = spike_positions[i] / self.sampling_rate
-                    
-                    # Add augmentation flag if applicable and not a test sample
-                    if not is_test_set and i >= len(segments) - self.dataset_metadata['processing_stats'].get('augmented_segments', 0):
-                        metadata['augmented'] = True
+                # Only check a sample of files to avoid overhead
+                sample_size = min(len(processed_files), 100)
+                sampled_files = np.random.choice(processed_files, sample_size, replace=False)
+                
+                for filename in sampled_files:
+                    file_path = os.path.join(split_dir, filename)
+                    try:
+                        sample = torch.load(file_path, map_location='cpu')
+                        label = sample['label'].item()
+                        class_counts[label] += 1
+                    except:
+                        pass
                         
-                    torch.save(metadata, file_path)
-                    
-                    # Update tracking
-                    processed_files.append(f"{file_prefix}.pt")
-                    class_counts[labels[i]] += 1
+                # Estimate full distribution
+                scaling_factor = len(processed_files) / sample_size
+                class_counts = {k: int(v * scaling_factor) for k, v in class_counts.items()}
                 
                 if is_test_set:
-                    self.logger.info(f"Test set file processed: {file_info['path']} - {len(segments)} segments ({sum(labels)} spikes)")
+                    self.logger.info(f"Test set file processed: {file_info['path']} - {len(processed_files)} segments (approx. {class_counts[1]} spikes)")
                 
                 return True, {'split': split, 'files': processed_files, 'class_counts': class_counts}
             return False, None
@@ -1096,7 +2009,7 @@ class MEGPreprocessor:
             self.logger.error(f"Error processing {file_info['path']}: {str(e)}")
             return False, None
 
-    # Main method
+
     def process_all(self, interpolate: bool) -> None:
         """Process all .ds files in the root directory.
 
@@ -1111,6 +2024,8 @@ class MEGPreprocessor:
         Raises:
             ValueError: If no .ds files are found.
         """
+        start_time = time.time()
+        
         ds_files = self.find_ds_files()
 
         if not ds_files:
@@ -1125,9 +2040,6 @@ class MEGPreprocessor:
         if self.n_jobs > 1:
             # Parallel processing using a simpler technique that avoids pickling errors
             self.logger.info(f"Processing {len(ds_files)} files with {self.n_jobs} parallel jobs")
-            
-            # Use multiprocessing.Pool with a method instead of ProcessPoolExecutor
-            import multiprocessing as mp
             
             # Disable debug logging during multiprocessing to avoid log contention
             logging_level = self.logger.level
@@ -1171,6 +2083,11 @@ class MEGPreprocessor:
                         self.dataset_metadata['class_distribution'][split][label] += count
                     self.dataset_metadata['processing_stats']['processed_files'] += 1
 
+        # Update channel rankings
+        if self.channel_stats:
+            self.logger.info("Updating channel rankings...")
+            self._update_channel_rankings()
+
         # Save the file lists
         for split_name in ['train', 'val', 'test']:
             split_file = os.path.join(self.output_dir, f"{split_name}_files.pkl")
@@ -1201,6 +2118,47 @@ class MEGPreprocessor:
         with open(metadata_yaml, 'w') as f:
             yaml.dump(self.dataset_metadata, f, default_flow_style=False)
         self.logger.info(f"Saved human-readable metadata to {metadata_yaml}")
+        
+        # Save benchmark results if enabled
+        if self.benchmark:
+            total_time = time.time() - start_time
+            self.timing_stats['total_pipeline_time'] = total_time
+            
+            # Calculate aggregated statistics
+            files_per_second = self.timing_stats['file_count'] / total_time
+            segments_per_second = self.timing_stats['segment_count'] / total_time
+            
+            # Add summary statistics
+            self.timing_stats['summary'] = {
+                'files_per_second': files_per_second,
+                'segments_per_second': segments_per_second,
+                'average_time_per_file': total_time / self.timing_stats['file_count'] if self.timing_stats['file_count'] > 0 else 0,
+                'total_time_minutes': total_time / 60
+            }
+            
+            # Save the timing statistics
+            timing_file = os.path.join(self.output_dir, "timing_stats.json")
+            with open(timing_file, 'w') as f:
+                json.dump(self.timing_stats, f, indent=2)
+            self.logger.info(f"Saved timing statistics to {timing_file}")
+            
+        # Save channel statistics if enabled
+        if self.channel_stats:
+            # Save the channel statistics
+            channels_file = os.path.join(self.output_dir, "channel_stats.pkl")
+            with open(channels_file, 'wb') as f:
+                pickle.dump(self.channels_info, f)
+            self.logger.info(f"Saved channel statistics to {channels_file}")
+            
+            # Save a human-readable version
+            channels_yaml = os.path.join(self.output_dir, "channel_stats.yaml")
+            with open(channels_yaml, 'w') as f:
+                yaml.dump({
+                    'most_informative_channels': self.channels_info['most_informative'][:20],
+                    'summary': {
+                        'total_patients': len(self.channels_info['per_patient'])
+                    }
+                }, f, default_flow_style=False)
 
         self.logger.info(f"Processing complete. Files saved to {self.output_dir}")
         self.logger.info(f"Train: {len(self.processed_files['train'])} files "
@@ -1230,7 +2188,9 @@ class MEGPreprocessor:
         with open(weights_file, 'wb') as f:
             pickle.dump(class_weights, f)
         self.logger.info(f"Saved class weights to {weights_file}")
-
+        
+        # Save a sanity check visualization
+        self._save_data_examples()
 
 def validate_dataset(raw_data_file_path: Path,
                      processed_data_root: Path,
@@ -1238,7 +2198,8 @@ def validate_dataset(raw_data_file_path: Path,
                      good_channels_file_path: Optional[Path] = None,
                      loc_meg_channels_file_path: Optional[Path] = None,
                      logger: Optional[logging.Logger] = None,
-                     show_plot=False) -> None:
+                     show_plot: bool = False,
+                     output_dir: Optional[Path] = None) -> None:
     """Reconstruct a MEG recording from the torch fragments to validate preprocessing.
 
     This function:
@@ -1251,8 +2212,11 @@ def validate_dataset(raw_data_file_path: Path,
         raw_data_file_path: Path to the original .ds file
         processed_data_root: Path to the directory containing processed data
         processed_sfreq: Sampling frequency of the processed data
+        good_channels_file_path: Path to the file with good channels
+        loc_meg_channels_file_path: Path to the file with channel locations
         logger: Logger instance
         show_plot: If True, display the plot
+        output_dir: Optional directory to save visualization output (defaults to processed_data_root)
 
     Raises:
         ValueError: If no processed fragments are found for the patient
@@ -1321,7 +2285,7 @@ def validate_dataset(raw_data_file_path: Path,
                 if patient_id in file and filename_origin in file and file.endswith('.pt'):
                     fragment_path = os.path.join(split_dir, file)
                     try:
-                        fragment = torch.load(fragment_path, weights_only=False)
+                        fragment = torch.load(fragment_path, map_location='cpu')
                         all_fragments.append(fragment)
                     except Exception as e:
                         logger.error(f"Error loading {fragment_path}: {e}")
@@ -1387,7 +2351,12 @@ def validate_dataset(raw_data_file_path: Path,
 
     # Adjust display
     plt.tight_layout()
-    plot_path = os.path.join(processed_data_root, f"{patient_id}_{filename_origin}_validation.png")
+    
+    # Save to output_dir if provided, otherwise use processed_data_root
+    save_dir = output_dir if output_dir else processed_data_root
+    os.makedirs(save_dir, exist_ok=True)
+    
+    plot_path = os.path.join(save_dir, f"{patient_id}_{filename_origin}_validation.png")
     plt.savefig(plot_path)
     logger.info(f"Saved validation plot to {plot_path}")
     if show_plot:
@@ -1434,14 +2403,17 @@ def validate_dataset(raw_data_file_path: Path,
             plt.axvline(clip_length_samples/2, color='r', linestyle='--', label="Segment Center")
             plt.legend()
             
-            pos_plot_path = os.path.join(processed_data_root, f"{patient_id}_{filename_origin}_spike_positions.png")
+            # Save to output_dir if provided, otherwise use processed_data_root
+            save_dir = output_dir if output_dir else processed_data_root
+            pos_plot_path = os.path.join(save_dir, f"{patient_id}_{filename_origin}_spike_positions.png")
             plt.savefig(pos_plot_path)
             logger.info(f"Saved spike position histogram to {pos_plot_path}")
             if show_plot:
                 plt.show()
 
 
-def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> None:
+def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None, 
+                visualize: bool = True, n_samples: int = 2) -> Dict[str, Any]:
     """Test the MEG datasets to ensure they're correctly loaded.
 
     This function:
@@ -1449,10 +2421,16 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
     2. Creates datasets for each split
     3. Tests loading a sample from each dataset
     4. Reports class distribution statistics
+    5. Optionally creates visualizations of sample data
 
     Args:
         output_dir: Directory containing the processed data
         logger: Logger instance
+        visualize: Whether to create visualizations
+        n_samples: Number of samples to visualize per class
+
+    Returns:
+        Dictionary with test results
     """
     logger = logger or logging.getLogger(__name__)
     logger.info("Testing MEG Dataset...")
@@ -1467,7 +2445,7 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
             test_files = pickle.load(f)
     except Exception as e:
         logger.error(f"Error loading file lists: {e}")
-        return
+        return {}
 
     # Load class weights if available
     try:
@@ -1527,9 +2505,19 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
             logger.warning(f"No samples found in {name} dataset")
 
     # Check dataset metadata if available
+    test_results = {
+        'metadata': {},
+        'splits': {},
+        'patient_distribution': {},
+        'class_distribution': {},
+        'sample_data': {}
+    }
+    
     try:
         with open(os.path.join(output_dir, "dataset_metadata.pkl"), 'rb') as f:
             metadata = pickle.load(f)
+        
+        test_results['metadata'] = metadata
         
         logger.info("Dataset Metadata:")
         logger.info(f"  Sampling rate: {metadata['config']['sampling_rate']} Hz")
@@ -1544,9 +2532,12 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
         logger.info(f"  Processed files: {stats['processed_files']}")
         logger.info(f"  Skipped (pattern match): {stats.get('skipped_pattern', 0)}")
         logger.info(f"  Skipped (too few spikes): {stats.get('skipped_low_spikes', 0)}")
+        logger.info(f"  No-spike files processed: {stats.get('no_spike_files_processed', 0)}")
         logger.info(f"  Augmented segments: {stats.get('augmented_segments', 0)}")
         
         logger.info("Class Distribution:")
+        test_results['class_distribution'] = metadata['class_distribution']
+        
         for split, distr in metadata['class_distribution'].items():
             total = distr[0] + distr[1]
             if total > 0:
@@ -1562,6 +2553,9 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
         
         with open(os.path.join(output_dir, "patient_groups.pkl"), 'rb') as f:
             patient_groups = pickle.load(f)
+            
+        test_results['patient_splits'] = patient_splits
+        test_results['patient_groups'] = patient_groups
 
         logger.info("Patient distribution across splits:")
         split_counts = {"train": 0, "val": 0, "test": 0}
@@ -1580,8 +2574,123 @@ def test_datasets(output_dir: str, logger: Optional[logging.Logger] = None) -> N
             logger.info(f"  {group}:")
             for split, count in splits.items():
                 logger.info(f"    {split.capitalize()}: {count} patients")
+                
+        test_results['patient_distribution'] = {
+            'split_counts': split_counts,
+            'group_counts': dict(group_counts)
+        }
     except FileNotFoundError:
         logger.warning("Patient split information not found")
+        
+    # Check timing statistics if available
+    try:
+        with open(os.path.join(output_dir, "timing_stats.json"), 'r') as f:
+            timing_stats = json.load(f)
+            
+        logger.info("Processing Performance:")
+        if 'summary' in timing_stats:
+            summary = timing_stats['summary']
+            logger.info(f"  Total processing time: {summary.get('total_time_minutes', 0):.1f} minutes")
+            logger.info(f"  Files per second: {summary.get('files_per_second', 0):.2f}")
+            logger.info(f"  Segments per second: {summary.get('segments_per_second', 0):.2f}")
+            
+        test_results['timing'] = timing_stats
+    except FileNotFoundError:
+        logger.debug("Timing statistics not found")
+        
+    # Check channel statistics if available
+    try:
+        with open(os.path.join(output_dir, "channel_stats.pkl"), 'rb') as f:
+            channel_stats = pickle.load(f)
+            
+        if 'most_informative' in channel_stats and channel_stats['most_informative']:
+            logger.info("Most informative channels:")
+            for i, ch_info in enumerate(channel_stats['most_informative'][:5]):
+                logger.info(f"  {i+1}. Channel {ch_info['channel_idx']}: correlation={ch_info['correlation']:.3f}")
+                
+        test_results['channel_stats'] = {
+            'most_informative': channel_stats.get('most_informative', [])[:10]
+        }
+    except FileNotFoundError:
+        logger.debug("Channel statistics not found")
+        
+    # Visualize a few examples if requested
+    if visualize:
+        logger.info("Visualizing sample data...")
+        viz_dir = os.path.join(output_dir, "test_visualizations")
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        for name, dataset in [("Train", train_dataset), ("Validation", val_dataset), ("Test", test_dataset)]:
+            if len(dataset) == 0:
+                continue
+                
+            # Get samples of each class if possible
+            spike_samples = []
+            non_spike_samples = []
+            
+            # Try to find samples of both classes
+            for i in np.random.choice(len(dataset), min(100, len(dataset)), replace=False):
+                try:
+                    result = dataset[i]
+                    if len(result) >= 2:
+                        data, label = result[0], result[1]
+                        label_val = label.item()
+                        
+                        if label_val == 1 and len(spike_samples) < n_samples:
+                            spike_samples.append((data, i))
+                        elif label_val == 0 and len(non_spike_samples) < n_samples:
+                            non_spike_samples.append((data, i))
+                            
+                        if len(spike_samples) >= n_samples and len(non_spike_samples) >= n_samples:
+                            break
+                except Exception as e:
+                    logger.warning(f"Error loading sample {i}: {e}")
+            
+            # Create visualizations
+            for sample_type, samples in [("spike", spike_samples), ("non_spike", non_spike_samples)]:
+                for idx, (data, sample_idx) in enumerate(samples):
+                    try:
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        
+                        # Plot multiple channels with different colors
+                        n_channels = min(8, data.shape[0])  # Limit to 8 channels for clarity
+                        time_axis = np.arange(data.shape[1]) / processed_sfreq
+                        
+                        # Use a color cycle for multiple channels
+                        colors = plt.cm.tab10(np.linspace(0, 1, n_channels))
+                        
+                        for ch_idx in range(n_channels):
+                            # Offset each channel for better visualization
+                            ax.plot(time_axis, data[ch_idx] + ch_idx * 2, color=colors[ch_idx], 
+                                  label=f"Channel {ch_idx}")
+                        
+                        ax.set_xlabel('Time (s)')
+                        ax.set_ylabel('Amplitude (a.u.)')
+                        ax.set_title(f"{name} {sample_type.replace('_', ' ')} example (sample {sample_idx})")
+                        
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(viz_dir, f"{name.lower()}_{sample_type}_{idx}.png"))
+                        plt.close(fig)
+                        
+                        # Store sample information
+                        if name.lower() not in test_results['sample_data']:
+                            test_results['sample_data'][name.lower()] = {}
+                        
+                        if sample_type not in test_results['sample_data'][name.lower()]:
+                            test_results['sample_data'][name.lower()][sample_type] = []
+                            
+                        test_results['sample_data'][name.lower()][sample_type].append({
+                            'sample_idx': int(sample_idx),
+                            'shape': tuple(data.shape),
+                            'visualization': f"{name.lower()}_{sample_type}_{idx}.png"
+                        })
+                        
+                    except Exception as e:
+                        logger.warning(f"Error creating visualization: {e}")
+        
+        logger.info(f"Saved test visualizations to {viz_dir}")
+            
+    return test_results
 
 
 def setup_logging(log_level: str, log_file: Optional[str] = None) -> Dict[str, logging.Logger]:
@@ -1636,6 +2745,7 @@ def setup_logging(log_level: str, log_file: Optional[str] = None) -> Dict[str, l
     return loggers
 
 
+
 def main():
     """Main function to run the MEG preprocessing pipeline."""
     import argparse
@@ -1660,17 +2770,38 @@ def main():
     parser.add_argument('--test', type=bool, default=False, help='Test the datasets after processing')
     parser.add_argument('--log_level', type=str, default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)')
     parser.add_argument('--log_file', type=str, default=None, help='Path to log file')
+    
+    # Preprocessing options
     parser.add_argument('--min_spikes_per_file', type=int, default=10, help='Minimum number of spikes required to process a file')
+    parser.add_argument('--process_no_spike_files', type=bool, default=False, help='Process files with no valid spikes as control data')
     parser.add_argument('--skip_files', type=str, nargs='+', default=[], help='List of filenames or patterns to skip')
+    
+    # Class balancing options
     parser.add_argument('--target_class_ratio', type=float, default=0.5, help='Target ratio of spike to non-spike samples (0.5 means balanced)')
     parser.add_argument('--balance_method', type=str, default='undersample', choices=['undersample', 'oversample', 'none'], help='Method for class balancing')
-    parser.add_argument('--augmentation_enabled', type=bool, default=False, help='Enable time-domain augmentation')
+    
+    # Augmentation options
+    parser.add_argument('--augmentation_enabled', type=bool, default=False, help='Enable data augmentation')
     parser.add_argument('--augmentation_time_shift_ms', type=int, default=50, help='Maximum time shift in milliseconds for augmentation')
     parser.add_argument('--augmentation_max_shifts', type=int, default=2, help='Number of time-shifted copies per spike segment')
+    parser.add_argument('--augmentation_amplitude_scale', type=bool, default=False, help='Enable amplitude scaling augmentation')
+    parser.add_argument('--augmentation_add_noise', type=bool, default=False, help='Enable noise addition augmentation')
+    parser.add_argument('--augmentation_channel_dropout', type=bool, default=False, help='Enable channel dropout augmentation')
+    
+    # Normalization options
     parser.add_argument('--normalization_method', type=str, default='percentile', choices=['percentile', 'zscore', 'minmax'], help='Method for data normalization')
     parser.add_argument('--normalization_percentile', type=int, default=95, help='Percentile value for percentile normalization')
+    
+    # Performance options
     parser.add_argument('--n_jobs', type=int, default=1, help='Number of parallel jobs to use')
     parser.add_argument('--max_segments_per_file', type=int, default=None, help='Maximum number of segments to extract per file')
+    parser.add_argument('--online_saving', type=bool, default=True, help='Save segments immediately after processing to reduce memory usage')
+    parser.add_argument('--benchmark', type=bool, default=True, help='Collect timing statistics')
+    
+    # Additional analysis options
+    parser.add_argument('--channel_stats', type=bool, default=True, help='Collect channel statistics')
+    parser.add_argument('--validation_output_dir', type=str, default=None, help='Output directory for validation visualizations')
+    parser.add_argument('--visualize_test', type=bool, default=True, help='Create visualizations when testing the dataset')
 
     args = parser.parse_args()
 
@@ -1680,14 +2811,13 @@ def main():
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
     
-    # Merge CLI arguments with config file (config file takes precedence)
+    # Merge CLI arguments with config file (CLI arguments take precedence)
     # Convert args to dict, skipping None values (not provided)
     args_dict = {k: v for k, v in vars(args).items() if v is not None and k != 'config'}
     
-    # Merge args_dict with config (config takes precedence)
+    # Merge args_dict with config (CLI args take precedence over config)
     for key, value in args_dict.items():
-        if key not in config:
-            config[key] = value
+        config[key] = value
     
     # Check if required arguments are provided
     required_args = ['root_dir', 'output_dir', 'good_channels_file_path', 'loc_meg_channels_file_path']
@@ -1720,6 +2850,12 @@ def main():
         'time_shift_ms': config.get('augmentation_time_shift_ms', 50),
         'max_shifts': config.get('augmentation_max_shifts', 2),
         'preserve_spikes': True,
+        'amplitude_scale': config.get('augmentation_amplitude_scale', False),
+        'amplitude_range': (0.8, 1.2),
+        'add_noise': config.get('augmentation_add_noise', False),
+        'noise_level': 0.05,
+        'channel_dropout': config.get('augmentation_channel_dropout', False),
+        'channel_dropout_rate': 0.1
     }
     
     normalization = {
@@ -1733,6 +2869,25 @@ def main():
     loggers['main'].info("Configuration:")
     for key, value in config.items():
         loggers['main'].info(f"  {key}: {value}")
+        
+    # Validate augmentation parameters if enabled
+    if config.get('augmentation_enabled', False):
+        # Check if time shift is too large for clip length
+        clip_length_ms = config.get('clip_length_s', 1.0) * 1000
+        time_shift_ms = config.get('augmentation_time_shift_ms', 50)
+        
+        if time_shift_ms > clip_length_ms / 2:
+            loggers['main'].warning(
+                f"Augmentation time shift ({time_shift_ms}ms) is too large for clip length ({clip_length_ms}ms). "
+                f"Consider reducing to at most {clip_length_ms/2}ms."
+            )
+        
+        # Check if max shifts is too high
+        max_shifts = config.get('augmentation_max_shifts', 2)
+        if max_shifts > 3:
+            loggers['main'].warning(
+                f"Augmentation max shifts ({max_shifts}) is quite high. Consider reducing to 2-3."
+            )
 
     # Initialize and run preprocessor
     loggers['main'].info("Starting MEG preprocessing pipeline...")
@@ -1751,6 +2906,7 @@ def main():
         val_ratio=val_ratio,
         random_state=config.get('random_state', 42),
         min_spikes_per_file=config.get('min_spikes_per_file', 10),
+        process_no_spike_files=config.get('process_no_spike_files', False),
         skip_files=config.get('skip_files', []),
         target_class_ratio=config.get('target_class_ratio', 0.5),
         balance_method=config.get('balance_method', 'undersample'),
@@ -1758,6 +2914,9 @@ def main():
         normalization=normalization,
         n_jobs=config.get('n_jobs', 1),
         max_segments_per_file=config.get('max_segments_per_file', None),
+        online_saving=config.get('online_saving', True),
+        benchmark=config.get('benchmark', True),
+        channel_stats=config.get('channel_stats', True),
         logger=loggers['processor']
     )
 
@@ -1773,13 +2932,37 @@ def main():
             processed_sfreq=config.get('sampling_rate', 200),
             good_channels_file_path=Path(config['good_channels_file_path']),
             loc_meg_channels_file_path=Path(config['loc_meg_channels_file_path']),
-            logger=loggers['validator']
+            logger=loggers['validator'],
+            output_dir=Path(config.get('validation_output_dir', config['output_dir']))
         )
 
     # Test the datasets if requested
     if config.get('test', False):
         loggers['main'].info("Testing datasets by getting sample's distribution...")
-        test_datasets(config['output_dir'], logger=loggers['dataset'])
+        test_results = test_datasets(
+            config['output_dir'], 
+            logger=loggers['dataset'],
+            visualize=config.get('visualize_test', True)
+        )
+        
+        # Save test results
+        test_results_file = os.path.join(config['output_dir'], "test_results.json")
+        try:
+            # Convert to JSON-serializable format
+            serializable_results = {}
+            for key, value in test_results.items():
+                if isinstance(value, dict):
+                    serializable_results[key] = value
+                else:
+                    serializable_results[key] = str(value)
+                    
+            with open(test_results_file, 'w') as f:
+                json.dump(serializable_results, f, indent=2)
+            loggers['main'].info(f"Saved test results to {test_results_file}")
+        except Exception as e:
+            loggers['main'].warning(f"Failed to save test results: {e}")
+            
+    loggers['main'].info("Pipeline execution completed successfully.")
 
 
 if __name__ == "__main__":
