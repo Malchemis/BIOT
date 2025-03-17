@@ -59,13 +59,13 @@ class LitModel_finetune(pl.LightningModule):
         prob = self.model(X)
         
         # Option 1: Original BCE loss (no weighting)
-        loss = BCE(prob, y)
+        # loss = BCE(prob, y)
         
         # Option 2: Weighted BCE with class-specific weights
         # loss = weighted_BCE(prob, y, self.class_weights)
         
         # Option 3: Original focal loss
-        # loss = focal_loss(prob, y, gamma=2.0)
+        loss = focal_loss(prob, y, alpha=0.8, gamma=0.7)
         
         # Option 4: Focal loss with class weights
         # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
@@ -96,7 +96,9 @@ class LitModel_finetune(pl.LightningModule):
         self.validation_step_outputs = []
 
     def on_validation_epoch_end(self):
-        """Process validation outputs at the end of validation epoch."""
+        """Process validation outputs at the end of validation epoch with scikit-learn optimized threshold."""
+        from sklearn.metrics import precision_recall_curve
+        
         val_step_outputs = self.validation_step_outputs
         result = np.array([])
         gt = np.array([])
@@ -104,29 +106,56 @@ class LitModel_finetune(pl.LightningModule):
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
 
-        if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
-            self.threshold = np.sort(result)[-int(np.sum(gt))] # threshold 
-            result = binary_metrics_fn(
+        if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 cases
+            # Get precision, recall, and thresholds from precision-recall curve
+            precision, recall, pr_thresholds = precision_recall_curve(gt, result)
+            
+            # Calculate F1 score for each threshold
+            # Convert to list and handle the case where pr_thresholds has one less element than precision/recall
+            pr_thresholds = np.append(pr_thresholds, 1.0)
+            f1_scores = [2 * p * r / (p + r + 1e-10) for p, r in zip(precision, recall)]
+            
+            # Find threshold with highest F1 score
+            best_idx = np.argmax(f1_scores)
+            self.threshold = pr_thresholds[best_idx]
+            
+            # Calculate and log metrics using the selected threshold
+            result_metrics = binary_metrics_fn(
                 gt,
                 result,
                 metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
+            
+            # Additional insight: log the performance at a standard 0.5 threshold for comparison
+            standard_metrics = binary_metrics_fn(
+                gt,
+                result,
+                metrics=["accuracy", "balanced_accuracy", "f1"],
+                threshold=0.5,
+            )
+            self.log("val_f1_standard", standard_metrics["f1"], sync_dist=True)
+            self.log("val_acc_standard", standard_metrics["accuracy"], sync_dist=True)
         else:
-            result = {
+            result_metrics = {
                 "accuracy": 0.0,
                 "balanced_accuracy": 0.0,
                 "pr_auc": 0.0,
                 "roc_auc": 0.0,
                 "f1": 0.0,
             }
-        self.log("val_acc", result["accuracy"], sync_dist=True)
-        self.log("val_bacc", result["balanced_accuracy"], sync_dist=True)
-        self.log("val_pr_auc", result["pr_auc"], sync_dist=True)
-        self.log("val_auroc", result["roc_auc"], sync_dist=True)
-        self.log("val_f1", result["f1"], sync_dist=True)
+            self.threshold = 0.5  # Default threshold if only one class is present
+        
+        # Log all metrics for TensorBoard
+        self.log("val_acc", result_metrics["accuracy"], sync_dist=True)
+        self.log("val_bacc", result_metrics["balanced_accuracy"], sync_dist=True)
+        self.log("val_pr_auc", result_metrics["pr_auc"], sync_dist=True)
+        self.log("val_auroc", result_metrics["roc_auc"], sync_dist=True)
+        self.log("val_f1", result_metrics["f1"], sync_dist=True)
         self.log("best_threshold", self.threshold, sync_dist=True)
-        self.custom_logger.info(f"Validation metrics: {result}")
+        
+        self.custom_logger.info(f"Validation metrics: {result_metrics}")
+        self.custom_logger.info(f"Optimal threshold: {self.threshold:.4f}")
 
     def test_step(self, batch, batch_idx):
         """Perform a single test step.
@@ -232,7 +261,7 @@ def prepare_custom_dataloader(args):
     logger = logging.getLogger(__name__)
     
     # Use the specified data root path
-    root = os.path.join(args.data_dir, "crnl-meg")
+    root = os.path.join(args.data_dir, "crnl-meg-new")
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
