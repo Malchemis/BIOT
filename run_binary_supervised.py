@@ -2,8 +2,13 @@ import random
 import os
 import argparse
 import logging
-from pathlib import Path
 from datetime import datetime
+
+# # we want to debug so we set
+# For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+# Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
 
 import torch
 import numpy as np
@@ -24,7 +29,6 @@ from model import (
     BIOTClassifier,
 )
 from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, focal_loss_with_class_weights, BCE, weighted_BCE
-
 
 class LitModel_finetune(pl.LightningModule):
     """PyTorch Lightning module for fine-tuning binary classification models.
@@ -59,13 +63,13 @@ class LitModel_finetune(pl.LightningModule):
         prob = self.model(X)
         
         # Option 1: Original BCE loss (no weighting)
-        # loss = BCE(prob, y)
+        loss = BCE(prob, y)
         
         # Option 2: Weighted BCE with class-specific weights
         # loss = weighted_BCE(prob, y, self.class_weights)
         
         # Option 3: Original focal loss
-        loss = focal_loss(prob, y, alpha=0.8, gamma=0.7)
+        # loss = focal_loss(prob, y, alpha=0.8, gamma=0.7)
         
         # Option 4: Focal loss with class weights
         # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
@@ -261,7 +265,7 @@ def prepare_custom_dataloader(args):
     logger = logging.getLogger(__name__)
     
     # Use the specified data root path
-    root = os.path.join(args.data_dir, "crnl-meg-new")
+    root = args.data_dir
 
     train_files = os.listdir(os.path.join(root, "train"))
     np.random.shuffle(train_files)
@@ -571,14 +575,11 @@ def supervised(args):
             patch_size=args.patch_size, 
             overlap=args.overlap,
         )
-        if args.pretrain_model_path and (args.sampling_rate == 200):
-            model.biot.load_state_dict(torch.load(args.pretrain_model_path))
-            logger.info(f"Loaded pretrained model from {args.pretrain_model_path}")
 
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
         
-    lightning_model = LitModel_finetune(args, model)
+    lightning_model = LitModel_finetune.load_from_checkpoint(args.pretrain_model_path, args=args, model=model) if args.pretrain_model_path else LitModel_finetune(args, model)
 
     # Logger and callbacks
     version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
