@@ -99,15 +99,6 @@ def relaxed_scores(true, pred):
     return relaxed_metrics
 
 class LitModel_finetune(pl.LightningModule):
-    """PyTorch Lightning module for fine-tuning binary classification models.
-    
-    This class wraps various neural network models to enable training, validation,
-    and testing with PyTorch Lightning.
-    
-    Args:
-        args (argparse.Namespace): Command-line arguments
-        model: The neural network model to use
-    """
     def __init__(self, args: argparse.Namespace, model):
         super().__init__()
         self.model = model
@@ -116,147 +107,180 @@ class LitModel_finetune(pl.LightningModule):
         self.validation_step_outputs = []
         self.test_step_outputs = []
         self.custom_logger = logging.getLogger(__name__)
+        
+        # Determine if we're using chunk-based output mode
+        self.chunk_mode = hasattr(self.model, 'return_sequences') and self.model.return_sequences
 
     def training_step(self, batch, batch_idx):
         """Perform a single training step.
         
-        Args:
-            batch: A batch of data (inputs and targets)
-            batch_idx: Index of the batch
-            
-        Returns:
-            The calculated loss
+        Handles both single-output and multi-output (chunk) mode.
         """
         X, y = batch
+        
+        # Forward pass through the model
         prob = self.model(X)
         
-        # Option 1: Original BCE loss (no weighting)
-        loss = BCE(prob, y)
+        if self.chunk_mode:
+            # In chunk mode, prob is [batch, chunk_size, n_classes]
+            # and y is either [batch, chunk_size] or [batch, 1]
+            
+            # Check if y is already in the right shape, if not reshape it
+            if y.dim() == 2 and y.shape[1] == prob.shape[1]:
+                # y is already [batch, chunk_size]
+                chunk_y = y
+            else:
+                # Assume y is [batch, 1] and we need to expand it to match the chunks
+                chunk_y = y.repeat(1, prob.shape[1])
+            
+            # Flatten both predictions and labels for loss calculation
+            # [batch, chunk_size, n_classes] -> [batch*chunk_size, n_classes]
+            flat_prob = prob.reshape(-1, prob.shape[-1])
+            # [batch, chunk_size] -> [batch*chunk_size]
+            flat_y = chunk_y.reshape(-1)
+            
+            # Calculate loss on flattened predictions and labels
+            loss = BCE(flat_prob, flat_y)
+        else:
+            # Standard single-output mode
+            loss = BCE(prob, y)
         
-        # Option 2: Weighted BCE with class-specific weights
-        # loss = weighted_BCE(prob, y, self.class_weights)
-        
-        # Option 3: Original focal loss
-        # loss = focal_loss(prob, y, alpha=0.8, gamma=0.7)
-        
-        # Option 4: Focal loss with class weights
-        # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Perform a single validation step.
+        """Perform a single validation step, collecting probabilities for metrics calculation.
         
-        Args:
-            batch: A batch of data (inputs and targets)
-            batch_idx: Index of the batch
-            
-        Returns:
-            Tuple of predictions and ground truth
+        Handles both single-output and multi-output (chunk) mode.
         """
         X, y = batch
         with torch.no_grad():
             prob = self.model(X)
-            step_result = torch.sigmoid(prob).cpu().numpy()
-            step_gt = y.cpu().numpy()
-        # Append the result to the list
-        self.validation_step_outputs.append((step_result, step_gt))
-        return step_result, step_gt
-
-    def on_validation_epoch_start(self):
-        """Initialize validation outputs collection at the start of validation."""
-        self.validation_step_outputs = []
+            
+            if self.chunk_mode:
+                # In chunk mode, prob is [batch, chunk_size, n_classes]
+                
+                # Check if y is in the right shape
+                if y.dim() == 2 and y.shape[1] == prob.shape[1]:
+                    # y is already [batch, chunk_size]
+                    chunk_y = y
+                else:
+                    # Expand y to match chunks
+                    chunk_y = y.repeat(1, prob.shape[1])
+                
+                # Convert to probabilities
+                step_probs = torch.sigmoid(prob)  # Still [batch, chunk_size, n_classes]
+                
+                # We'll collect all individual segment predictions for metrics
+                # Reshape to [batch*chunk_size, n_classes]
+                flat_probs = step_probs.reshape(-1, step_probs.shape[-1]).cpu().numpy()
+                flat_y = chunk_y.reshape(-1).cpu().numpy()
+                
+                self.validation_step_outputs.append((flat_probs, flat_y))
+            else:
+                # Standard single-output mode
+                step_probs = torch.sigmoid(prob).cpu().numpy()
+                step_gt = y.cpu().numpy()
+                self.validation_step_outputs.append((step_probs, step_gt))
+        
+        return prob, y
 
     def on_validation_epoch_end(self):
-        """Process validation outputs at the end of validation epoch with scikit-learn optimized threshold."""
+        """Calculate validation metrics.
+        
+        Works with both single-output and multi-output (chunk) mode.
+        """
         from sklearn.metrics import precision_recall_curve
         
         val_step_outputs = self.validation_step_outputs
         result = np.array([])
         gt = np.array([])
+        
         for out in val_step_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
 
         if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 cases
-            # Get precision, recall, and thresholds from precision-recall curve
+            # Find optimal threshold using PR curve
             precision, recall, pr_thresholds = precision_recall_curve(gt, result)
-            
-            # Calculate F1 score for each threshold
-            # Convert to list and handle the case where pr_thresholds has one less element than precision/recall
             pr_thresholds = np.append(pr_thresholds, 1.0)
             f1_scores = [2 * p * r / (p + r + 1e-10) for p, r in zip(precision, recall)]
-            
-            # Find threshold with highest F1 score
             best_idx = np.argmax(f1_scores)
             self.threshold = pr_thresholds[best_idx]
             
-            # Calculate and log metrics using the selected threshold
+            # Calculate metrics
             result_metrics = binary_metrics_fn(
-                gt,
-                result,
-                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
+                gt, result, metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
             
-            # Additional insight: log the performance at a standard 0.5 threshold for comparison
+            # Log standard threshold metrics for comparison
             standard_metrics = binary_metrics_fn(
-                gt,
-                result,
-                metrics=["accuracy", "balanced_accuracy", "f1"],
+                gt, result, metrics=["accuracy", "balanced_accuracy", "f1"],
                 threshold=0.5,
             )
             self.log("val_f1_standard", standard_metrics["f1"], sync_dist=True)
             self.log("val_acc_standard", standard_metrics["accuracy"], sync_dist=True)
         else:
             result_metrics = {
-                "accuracy": 0.0,
-                "balanced_accuracy": 0.0,
-                "pr_auc": 0.0,
-                "roc_auc": 0.0,
-                "f1": 0.0,
+                "accuracy": 0.0, "balanced_accuracy": 0.0, "pr_auc": 0.0,
+                "roc_auc": 0.0, "f1": 0.0,
             }
-            self.threshold = 0.5  # Default threshold if only one class is present
+            self.threshold = 0.5
         
-        # Log all metrics for TensorBoard
-        self.log("val_acc", result_metrics["accuracy"], sync_dist=True)
-        self.log("val_bacc", result_metrics["balanced_accuracy"], sync_dist=True)
-        self.log("val_pr_auc", result_metrics["pr_auc"], sync_dist=True)
-        self.log("val_auroc", result_metrics["roc_auc"], sync_dist=True)
-        self.log("val_f1", result_metrics["f1"], sync_dist=True)
+        # Log metrics
+        for key, value in result_metrics.items():
+            self.log(f"val_{key}", value, sync_dist=True)
         self.log("best_threshold", self.threshold, sync_dist=True)
         
         self.custom_logger.info(f"Validation metrics: {result_metrics}")
         self.custom_logger.info(f"Optimal threshold: {self.threshold:.4f}")
 
     def test_step(self, batch, batch_idx):
-        """Perform a single test step.
+        """Perform a single test step, collecting probabilities for metrics calculation.
         
-        Args:
-            batch: A batch of data (inputs and targets)
-            batch_idx: Index of the batch
-            
-        Returns:
-            Tuple of predictions and ground truth
+        Handles both single-output and multi-output (chunk) mode.
         """
         X, y = batch
         with torch.no_grad():
-            convScore = self.model(X)
-            step_result = torch.sigmoid(convScore).cpu().numpy()
-            step_gt = y.cpu().numpy()
-        # Append to the test outputs list
-        self.test_step_outputs.append((step_result, step_gt))
-        return step_result, step_gt
-
-    def on_test_epoch_start(self):
-        """Initialize test outputs collection at the start of testing."""
-        self.test_step_outputs = []
+            prob = self.model(X)
+            
+            if self.chunk_mode:
+                # In chunk mode, prob is [batch, chunk_size, n_classes]
+                
+                # Check if y is in the right shape
+                if y.dim() == 2 and y.shape[1] == prob.shape[1]:
+                    # y is already [batch, chunk_size]
+                    chunk_y = y
+                else:
+                    # Expand y to match chunks
+                    chunk_y = y.repeat(1, prob.shape[1])
+                
+                # Convert to probabilities
+                step_probs = torch.sigmoid(prob)  # [batch, chunk_size, n_classes]
+                
+                # Collect all segment predictions
+                flat_probs = step_probs.reshape(-1, step_probs.shape[-1]).cpu().numpy()
+                flat_y = chunk_y.reshape(-1).cpu().numpy()
+                
+                self.test_step_outputs.append((flat_probs, flat_y))
+            else:
+                # Standard single-output mode
+                step_probs = torch.sigmoid(prob).cpu().numpy()
+                step_gt = y.cpu().numpy()
+                self.test_step_outputs.append((step_probs, step_gt))
+        
+        return prob, y
 
     def on_test_epoch_end(self):
-        """Process test outputs at the end of test epoch with extended metrics."""
+        """Calculate test metrics including relaxed scores for spike detection.
+        
+        Works with both single-output and multi-output (chunk) mode.
+        """
         test_step_outputs = self.test_step_outputs
         result = np.array([])
         gt = np.array([])
+        
         for out in test_step_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
@@ -265,80 +289,43 @@ class LitModel_finetune(pl.LightningModule):
         binary_pred = (result >= self.threshold).astype(int)
         
         metrics = {}
-        if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
-            # Calculate standard metrics
+        if sum(gt) * (len(gt) - sum(gt)) != 0:
+            # Standard metrics
             metrics = binary_metrics_fn(
-                gt,
-                result,
+                gt, result,
                 metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
             
-            # Calculate precision and recall manually
+            # Additional metrics
             metrics["precision"] = precision_score(gt, binary_pred)
             metrics["recall"] = recall_score(gt, binary_pred)
             
-            # Calculate confusion matrix (TP, FP, TN, FN)
+            # Confusion matrix
             tn, fp, fn, tp = confusion_matrix(gt, binary_pred, labels=[0, 1]).ravel()
             metrics["true_positives"] = int(tp)
             metrics["false_positives"] = int(fp)
             metrics["true_negatives"] = int(tn)
             metrics["false_negatives"] = int(fn)
             
-            # Calculate relaxed scores
+            # Relaxed scores
             relaxed_metrics = relaxed_scores(gt, binary_pred)
-            
-            # Add relaxed metrics to the metrics dict
             metrics.update(relaxed_metrics)
             
         else:
-            # Default metrics if only one class is present
+            # Default metrics for one-class case
             metrics = {
-                "accuracy": 0.0,
-                "balanced_accuracy": 0.0,
-                "pr_auc": 0.0,
-                "roc_auc": 0.0,
-                "f1": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "true_positives": 0,
-                "false_positives": 0,
-                "true_negatives": 0,
-                "false_negatives": 0,
-                "relaxed_f1": 0.0,
-                "relaxed_precision": 0.0,
-                "relaxed_recall": 0.0,
-                "relaxed_sensitivity": 0.0,
-                "relaxed_specificity": 0.0,
-                "relaxed_accuracy": 0.0,
-                "relaxed_tp": 0,
-                "relaxed_tn": 0,
-                "relaxed_fp": 0,
-                "relaxed_fn": 0
+                "accuracy": 0.0, "balanced_accuracy": 0.0, "pr_auc": 0.0, "roc_auc": 0.0, 
+                "f1": 0.0, "precision": 0.0, "recall": 0.0,
+                "true_positives": 0, "false_positives": 0, "true_negatives": 0, "false_negatives": 0,
+                "relaxed_f1": 0.0, "relaxed_precision": 0.0, "relaxed_recall": 0.0,
+                "relaxed_sensitivity": 0.0, "relaxed_specificity": 0.0, "relaxed_accuracy": 0.0,
+                "relaxed_tp": 0, "relaxed_tn": 0, "relaxed_fp": 0, "relaxed_fn": 0
             }
         
-        # Log all metrics for TensorBoard
-        self.log("test_acc", metrics["accuracy"], sync_dist=True)
-        self.log("test_bacc", metrics["balanced_accuracy"], sync_dist=True)
-        self.log("test_pr_auc", metrics["pr_auc"], sync_dist=True)
-        self.log("test_auroc", metrics["roc_auc"], sync_dist=True)
-        self.log("test_f1", metrics["f1"], sync_dist=True)
-        self.log("test_precision", metrics["precision"], sync_dist=True)
-        self.log("test_recall", metrics["recall"], sync_dist=True)
-        
-        # Log confusion matrix metrics
-        self.log("test_true_positives", metrics["true_positives"], sync_dist=True)
-        self.log("test_false_positives", metrics["false_positives"], sync_dist=True)
-        self.log("test_true_negatives", metrics["true_negatives"], sync_dist=True)
-        self.log("test_false_negatives", metrics["false_negatives"], sync_dist=True)
-        
-        # Log relaxed metrics
-        self.log("test_relaxed_f1", metrics["relaxed_f1"], sync_dist=True)
-        self.log("test_relaxed_precision", metrics["relaxed_precision"], sync_dist=True)
-        self.log("test_relaxed_recall", metrics["relaxed_recall"], sync_dist=True)
-        self.log("test_relaxed_sensitivity", metrics["relaxed_sensitivity"], sync_dist=True)
-        self.log("test_relaxed_specificity", metrics["relaxed_specificity"], sync_dist=True)
-        self.log("test_relaxed_accuracy", metrics["relaxed_accuracy"], sync_dist=True)
+        # Log all metrics
+        for key, value in metrics.items():
+            self.log(f"test_{key}", value, sync_dist=True)
         
         # Log detailed results
         confusion_matrix_str = f"""
@@ -427,7 +414,7 @@ def prepare_custom_dataloader(args):
 
     # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "train"), train_files),
+        MEGDataset(os.path.join(root, "train"), train_files, chunk_mode=args.chunk_mode),
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
@@ -436,7 +423,7 @@ def prepare_custom_dataloader(args):
         worker_init_fn=seed_worker
     )
     test_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "test"), test_files),
+        MEGDataset(os.path.join(root, "test"), test_files, chunk_mode=args.chunk_mode),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -444,7 +431,7 @@ def prepare_custom_dataloader(args):
         worker_init_fn=seed_worker
     )
     val_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "val"), val_files),
+        MEGDataset(os.path.join(root, "val"), val_files, chunk_mode=args.chunk_mode),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -725,6 +712,8 @@ def supervised(args):
             raw=args.raw, 
             patch_size=args.patch_size, 
             overlap=args.overlap,
+            chunk_size=args.chunk_size,  # Pass chunk_size parameter
+            return_sequences=args.chunk_mode,  # Enable sequence return mode based on argument
         )
 
     else:
@@ -892,6 +881,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="MEG", 
                         choices=["MEG", "TUAB", "CHB-MIT", "PTB"],
                         help="which dataset to use")
+    parser.add_argument("--chunk_mode", action="store_true", 
+                    help="Enable chunk mode for multi-segment prediction")
     
     # Model parameters
     parser.add_argument("--model", type=str, default="SPaRCNet", 

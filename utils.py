@@ -9,63 +9,79 @@ from typing import List, Tuple, Optional, Dict, Union
 
 
 class MEGDataset(torch.utils.data.Dataset):
-    """PyTorch Dataset for loading preprocessed MEG data.
-
-    This dataset loads preprocessed MEG data from disk, stored as PyTorch tensors.
-    Each data sample contains the MEG signal and its associated label.
-
-    Attributes:
-        root: Root directory containing the processed data.
-        files: List of filenames to use.
-        class_weights: Optional weights for each class to handle imbalance.
+    """Dataset for loading MEG data with uniform chunk-based processing.
+    
+    This dataset consistently loads data with a chunk dimension, whether
+    dealing with individual segments or multiple segments per chunk.
     """
-
-    def __init__(self, root: str, files: List[str], class_weights: Optional[Dict[int, float]] = None):
-        """Initialize the MEG dataset.
-
+    
+    def __init__(self, root: str, files: List[str]):
+        """Initialize the dataset.
+        
         Args:
             root: Root directory containing the processed data.
             files: List of filenames to use.
-            class_weights: Optional dictionary mapping class indices to weights.
         """
         self.root = root
         self.files = files
-        self.class_weights = class_weights
-        self.custom_logger = logging.getLogger(__name__)
-
-    def __len__(self) -> int:
-        """Return the number of samples in the dataset.
-
-        Returns:
-            Number of samples in the dataset.
-        """
+        
+    def __len__(self):
         return len(self.files)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    def __getitem__(self, idx):
         """Get a sample from the dataset.
-
-        Args:
-            idx: Index of the sample to retrieve.
-
+        
         Returns:
-            Tuple containing the MEG data and its label.
+            Tuple of (data, labels) where:
+            - data has shape (batch_size, chunk_size, n_channels, n_samples_per_clip)
+            - labels has shape (batch_size, chunk_size)
         """
-        # Load MEG data of shape (n_channels, sample_length)
-        file_path = Path(self.root, self.files[idx])
-        try:
-            sample = torch.load(file_path, weights_only=False)
+        file_path = os.path.join(self.root, self.files[idx])
+        sample = torch.load(file_path, map_location='cpu')
+        
+        # Determine if this is a multi-segment chunk or single segment
+        is_chunk = sample.get('is_chunk', False)
+        
+        if is_chunk:
+            # Multi-segment chunk
+            data = sample['data']  # Shape: (chunk_size, n_channels, n_samples_per_clip)
+            labels = sample['label']  # Shape: (chunk_size)
             
-            # Check if required keys exist in the sample
-            if 'data' not in sample or 'label' not in sample:
-                self.custom_logger.warning(f"File {file_path} missing required keys. Found keys: {sample.keys()}")
-                data, label = None, None
+            # Ensure data has the correct dimensions
+            if len(data.shape) == 3:
+                # Already in correct format: (chunk_size, n_channels, n_samples_per_clip)
+                pass
+            elif len(data.shape) == 2:
+                # Single-channel case, add channel dimension
+                data = data.unsqueeze(1)
             else:
-                data, label = sample['data'], sample['label']
-            return data, label
+                raise ValueError(f"Unexpected data shape: {data.shape}")
+                
+            # Ensure labels has the right shape
+            if not isinstance(labels, torch.Tensor):
+                labels = torch.tensor(labels)
+            if len(labels.shape) == 0:
+                # Single scalar label, make it a 1D tensor
+                labels = labels.unsqueeze(0)
+        else:
+            # Single segment, add chunk dimension
+            data = sample['data']  # Shape: (n_channels, n_samples)
+            label = sample['label']  # Scalar or 1D tensor with single value
             
-        except Exception as e:
-            self.custom_logger.error(f"Error loading file {file_path}: {str(e)}")
-            return None, None
+            # Add chunk dimension (of size 1)
+            data = data.unsqueeze(0)  # Shape: (1, n_channels, n_samples)
+            
+            # Convert label to tensor if needed
+            if not isinstance(label, torch.Tensor):
+                label = torch.tensor(label)
+            
+            # Ensure label has the right shape
+            if len(label.shape) == 0:
+                labels = label.unsqueeze(0)  # Shape: (1)
+            else:
+                labels = label
+        
+        return data, labels
 
 
 class TUABLoader(torch.utils.data.Dataset):

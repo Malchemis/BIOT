@@ -120,6 +120,90 @@ class PatchTimeEmbedding(nn.Module):
         x = self.projection(x)  # (batch, n_patches, emb_size)
         return x
 
+class ChunkClassificationHead(nn.Module):
+    """Classification head for chunk-based processing with context awareness.
+    
+    This module takes embeddings from multiple segments in a chunk and produces
+    class probabilities for each segment, leveraging context from the entire chunk.
+    """
+    
+    def __init__(self, emb_size: int, n_classes: int, mode: str = 'attention', log_dir: Optional[str] = None):
+        """Initialize the chunk classification head.
+        
+        Args:
+            emb_size: Size of the input embedding.
+            n_classes: Number of output classes.
+            mode: Context capturing mode ('independent', 'sequential', or 'attention').
+            log_dir: Optional directory for log files.
+        """
+        super().__init__()
+        self.logger = logging.getLogger(__name__ + ".ChunkClassificationHead")
+        
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(os.path.join(log_dir, "chunk_classification_head.log"))
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(file_handler)
+            
+        self.logger.debug(f"Initialized with emb_size={emb_size}, n_classes={n_classes}, mode={mode}")
+        
+        self.mode = mode
+        
+        # Different context-capturing mechanisms based on mode
+        if mode == 'sequential':
+            # Bidirectional LSTM to capture sequential dependencies
+            self.context_layers = nn.LSTM(
+                input_size=emb_size,
+                hidden_size=emb_size // 2,  # Half size for bidirectional
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
+        elif mode == 'attention':
+            # Self-attention to capture relationships between segments
+            self.context_layers = nn.MultiheadAttention(
+                embed_dim=emb_size,
+                num_heads=4,
+                batch_first=True
+            )
+            # Add layer normalization and residual connection
+            self.norm = nn.LayerNorm(emb_size)
+        else:  # 'independent' mode
+            self.context_layers = nn.Identity()  # No context processing
+        
+        # Final classification layer
+        self.classifier = nn.Sequential(
+            nn.ELU(),
+            nn.Linear(emb_size, n_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the chunk classification head.
+        
+        Args:
+            x: Input embeddings tensor of shape (batch_size, chunk_size, emb_size)
+            
+        Returns:
+            Class logits of shape (batch_size, chunk_size, n_classes)
+        """
+        # Apply context-capturing layers based on mode
+        if self.mode == 'sequential':
+            # Process with LSTM
+            x, _ = self.context_layers(x)
+        elif self.mode == 'attention':
+            # Self-attention with residual connection and normalization
+            attn_output, _ = self.context_layers(x, x, x)
+            x = self.norm(x + attn_output)
+        
+        # Apply classifier to produce output of shape (batch_size, chunk_size, n_classes)
+        batch_size, chunk_size, emb_size = x.shape
+        
+        # Process all segments through the same classifier
+        # We'll operate on each position in the sequence dimension separately
+        logits = torch.stack([self.classifier(x[:, i]) for i in range(chunk_size)], dim=1)
+        
+        return logits
+
 
 class ClassificationHead(nn.Sequential):
     """Module for classification head.
@@ -337,7 +421,7 @@ class BIOTEncoder(nn.Module):
         return torch.abs(spectral)
 
     def forward(self, x: torch.Tensor, n_channel_offset: int = 0, perturb: bool = False) -> torch.Tensor:
-        """Forward pass of the BIOT encoder.
+        """Forward pass of the BIOT encoder with chunk-based output.
         
         Args:
             x: Input tensor of shape (batch_size, channel, ts).
@@ -345,7 +429,7 @@ class BIOTEncoder(nn.Module):
             perturb: Whether to randomly perturb the sequence.
             
         Returns:
-            Encoded tensor of shape (batch_size, emb_size).
+            Encoded tensor of shape (batch_size, n_segments, emb_size).
         """
         emb_seq = []
         # For each channel
@@ -374,7 +458,7 @@ class BIOTEncoder(nn.Module):
                 .repeat(batch_size, ts, 1) # repeat the channel embedding for all corresponding segments
             )
 
-            # Positional encoding: We add segment and channel emb, then we apply relative positional emb.
+            # Positional encoding
             channel_emb = self.positional_encoding(channel_emb + channel_token_emb)
 
             # perturb (create random mask)
@@ -387,23 +471,37 @@ class BIOTEncoder(nn.Module):
 
         # (batch_size, channels*ts, emb)
         emb = torch.cat(emb_seq, dim=1)
-        # (batch_size, emb)
-        emb = self.transformer(emb).mean(dim=1)
+        
+        # Apply transformer
+        emb = self.transformer(emb)
+        
+        # Reshape to group by segments
+        # Assuming the sequence dimension is organized as:
+        # [ch1_seg1, ch1_seg2, ..., ch1_segN, ch2_seg1, ..., chM_segN]
+        # We need to reshape to: [batch, num_segments, emb_size]
+        
+        # Calculate the number of segments per channel
+        n_channels = x.shape[1]
+        segs_per_channel = emb.shape[1] // n_channels
+        
+        # Reshape to [batch, channels, segments_per_channel, emb_size]
+        # Then transpose and reshape to get [batch, segments_per_channel, emb_size]
+        emb = emb.reshape(emb.shape[0], n_channels, segs_per_channel, emb.shape[-1])
+        emb = emb.transpose(1, 2).contiguous()
+        emb = emb.reshape(emb.shape[0], segs_per_channel, -1)
+        
         return emb
 
-
 class BIOTClassifier(nn.Module):
-    """Biomedical Input-Output Transformer (BIOT) Classifier.
+    """Biomedical Input-Output Transformer (BIOT) Classifier with chunk-based processing.
     
-    This model uses the BIOT encoder for feature extraction and adds a classification head.
-    
-    Attributes:
-        biot (BIOTEncoder): BIOT encoder for feature extraction.
-        classifier (ClassificationHead): Classification head.
+    This model processes chunks of segments and outputs predictions for each segment,
+    leveraging context across segments.
     """
     
     def __init__(self, emb_size: int = 256, heads: int = 8, depth: int = 4, n_classes: int = 6, 
-                 raw: bool = False, overlap: float = 0.0, log_dir: Optional[str] = None, **kwargs):
+                 raw: bool = False, overlap: float = 0.0, classification_mode: str = 'attention',
+                 log_dir: Optional[str] = None, **kwargs):
         """Initialize the BIOT classifier.
         
         Args:
@@ -413,7 +511,11 @@ class BIOTClassifier(nn.Module):
             n_classes: Number of output classes.
             raw: Whether to use raw time-domain processing.
             overlap: Overlap between patches for raw data mode.
-            log_dir: Optional directory for log files. If None, logs to console only.
+            classification_mode: How to process the chunk for classification:
+                - 'independent': Process each segment independently
+                - 'sequential': Use LSTM to capture sequence information
+                - 'attention': Use self-attention to capture context
+            log_dir: Optional directory for log files.
             **kwargs: Additional parameters passed to BIOTEncoder.
         """
         super().__init__()
@@ -430,20 +532,61 @@ class BIOTClassifier(nn.Module):
         
         self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, raw=raw, 
                                overlap=overlap, log_dir=log_dir, **kwargs)
-        self.classifier = ClassificationHead(emb_size, n_classes, log_dir=log_dir)
+        
+        # Use the enhanced chunk classification head
+        self.classifier = ChunkClassificationHead(
+            emb_size=emb_size, 
+            n_classes=n_classes, 
+            mode=classification_mode,
+            log_dir=log_dir
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the BIOT classifier.
         
         Args:
-            x: Input tensor of shape (batch_size, channel, ts).
+            x: Input tensor of shape (batch_size, channel, ts) or 
+               (batch_size, chunk_size, channel, ts) for chunked input.
             
         Returns:
-            Logits for each class.
+            Logits of shape (batch_size, chunk_size, n_classes)
         """
-        x = self.biot(x)
-        x = self.classifier(x)
-        return x
+        # Check if input has chunk dimension
+        is_chunked_input = len(x.shape) == 4
+        
+        if is_chunked_input:
+            # Process each segment in the chunk separately, then combine
+            batch_size, chunk_size, n_channels, ts = x.shape
+            
+            # Reshape to process all segments at once
+            x_reshaped = x.reshape(batch_size * chunk_size, n_channels, ts)
+            
+            # Get embeddings for all segments
+            embeddings = self.biot(x_reshaped)
+            
+            # Reshape back to separate batch and chunk dimensions
+            # embeddings shape: (batch_size * chunk_size, n_segments, emb_size)
+            _, n_segments, emb_size = embeddings.shape
+            
+            # Reshape to (batch_size, chunk_size, n_segments, emb_size)
+            embeddings = embeddings.reshape(batch_size, chunk_size, n_segments, emb_size)
+            
+            # For each batch item, process its chunks with the classifier
+            logits = torch.stack([
+                self.classifier(embeddings[b]) 
+                for b in range(batch_size)
+            ])
+            
+            return logits
+        else:
+            # Standard processing for non-chunked input
+            # Get segment embeddings from encoder
+            embeddings = self.biot(x)
+            
+            # Apply classifier to get predictions for each segment
+            logits = self.classifier(embeddings)
+            
+            return logits
 
 
 class UnsupervisedPretrain(nn.Module):
