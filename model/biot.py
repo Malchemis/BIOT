@@ -103,10 +103,10 @@ class PatchTimeEmbedding(nn.Module):
         time_steps = x.shape[2]
 
         # Calculate stride based on overlap
-        stride = int(self.patch_size * (1 - self.overlap))
-        stride = max(1, stride)  # Ensure stride is at least 1
+        stride = int(self.patch_size * (1 - self.overlap)) # e.g., 20 samples * (1 - 0.75) = 5 samples
+        stride = max(1, stride)  # Ensure stride is at least 1 sample
 
-        # Ensure we have enough time steps for at least one patch
+        # Ensure we have enough time steps/samples for at least one patch
         if time_steps < self.patch_size:
             error_msg = f"Input length ({time_steps}) must be >= patch_size ({self.patch_size})"
             self.logger.error(error_msg)

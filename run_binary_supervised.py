@@ -30,6 +30,74 @@ from model import (
 )
 from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, focal_loss_with_class_weights, BCE, weighted_BCE
 
+import torch
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, confusion_matrix, f1_score, accuracy_score
+
+def relaxed_scores(true, pred):
+    """
+    Calculate relaxed metrics allowing detections to be 1 window away from the ground truth.
+    
+    Args:
+        true: Array of ground truth labels
+        pred: Array of predictions
+        
+    Returns:
+        Dictionary containing relaxed metrics
+    """
+    relaxed_pred = np.zeros_like(pred)
+
+    for ind, l in enumerate(true):
+        # Left boundary condition
+        if ind == 0:
+            if l == 1:
+                if (pred[ind] == 1 or pred[ind+1] == 1):
+                    relaxed_pred[ind] = 1
+            elif pred[ind] == 1 and true[ind+1] == 0:
+                relaxed_pred[ind] = 1
+        # Right boundary condition
+        elif ind == true.shape[0] - 1:
+            if l == 1:
+                if (pred[ind] == 1 or pred[ind-1] == 1):
+                    relaxed_pred[ind] = 1
+            elif pred[ind] == 1 and true[ind-1] == 0:
+                relaxed_pred[ind] = 1        
+        # General case
+        elif l == 1:
+            if (pred[ind-1] == 1 or pred[ind] == 1 or pred[ind+1] == 1):
+                relaxed_pred[ind] = 1
+        elif pred[ind] == 1 and true[ind+1] == 0 and true[ind-1] == 0:
+            relaxed_pred[ind] = 1
+
+    # Calculate relaxed metrics
+    relaxed_tp = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 1)))
+    relaxed_tn = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 0)))
+    relaxed_fp = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 1)))
+    relaxed_fn = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 0)))
+    
+    # Calculate metrics, handling edge cases
+    relaxed_f1 = (2*relaxed_tp)/(2*relaxed_tp+relaxed_fp+relaxed_fn) if (2*relaxed_tp+relaxed_fp+relaxed_fn) else 1
+    relaxed_precision = (relaxed_tp / (relaxed_tp+relaxed_fp)) if (relaxed_tp+relaxed_fp) else 1
+    relaxed_recall = relaxed_sens = (relaxed_tp / (relaxed_tp+relaxed_fn)) if (relaxed_tp+relaxed_fn) else 1
+    relaxed_spec = (relaxed_tn / (relaxed_tn+relaxed_fp)) if (relaxed_tn+relaxed_fp) else 1
+    relaxed_acc = (relaxed_tp + relaxed_tn) / (relaxed_tp + relaxed_tn + relaxed_fp + relaxed_fn)
+    
+    # Create a dictionary of relaxed metrics
+    relaxed_metrics = {
+        "relaxed_f1": relaxed_f1,
+        "relaxed_precision": relaxed_precision,
+        "relaxed_recall": relaxed_recall,
+        "relaxed_sensitivity": relaxed_sens,
+        "relaxed_specificity": relaxed_spec,
+        "relaxed_accuracy": relaxed_acc,
+        "relaxed_tp": relaxed_tp,
+        "relaxed_tn": relaxed_tn,
+        "relaxed_fp": relaxed_fp,
+        "relaxed_fn": relaxed_fn
+    }
+    
+    return relaxed_metrics
+
 class LitModel_finetune(pl.LightningModule):
     """PyTorch Lightning module for fine-tuning binary classification models.
     
@@ -185,36 +253,119 @@ class LitModel_finetune(pl.LightningModule):
         self.test_step_outputs = []
 
     def on_test_epoch_end(self):
-        """Process test outputs at the end of test epoch."""
+        """Process test outputs at the end of test epoch with extended metrics."""
         test_step_outputs = self.test_step_outputs
         result = np.array([])
         gt = np.array([])
         for out in test_step_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
+        
+        # Convert continuous predictions to binary using the best threshold
+        binary_pred = (result >= self.threshold).astype(int)
+        
+        metrics = {}
         if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 and raise the AUROC error
-            result = binary_metrics_fn(
+            # Calculate standard metrics
+            metrics = binary_metrics_fn(
                 gt,
                 result,
                 metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
+            
+            # Calculate precision and recall manually
+            metrics["precision"] = precision_score(gt, binary_pred)
+            metrics["recall"] = recall_score(gt, binary_pred)
+            
+            # Calculate confusion matrix (TP, FP, TN, FN)
+            tn, fp, fn, tp = confusion_matrix(gt, binary_pred, labels=[0, 1]).ravel()
+            metrics["true_positives"] = int(tp)
+            metrics["false_positives"] = int(fp)
+            metrics["true_negatives"] = int(tn)
+            metrics["false_negatives"] = int(fn)
+            
+            # Calculate relaxed scores
+            relaxed_metrics = relaxed_scores(gt, binary_pred)
+            
+            # Add relaxed metrics to the metrics dict
+            metrics.update(relaxed_metrics)
+            
         else:
-            result = {
+            # Default metrics if only one class is present
+            metrics = {
                 "accuracy": 0.0,
                 "balanced_accuracy": 0.0,
                 "pr_auc": 0.0,
                 "roc_auc": 0.0,
                 "f1": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "true_positives": 0,
+                "false_positives": 0,
+                "true_negatives": 0,
+                "false_negatives": 0,
+                "relaxed_f1": 0.0,
+                "relaxed_precision": 0.0,
+                "relaxed_recall": 0.0,
+                "relaxed_sensitivity": 0.0,
+                "relaxed_specificity": 0.0,
+                "relaxed_accuracy": 0.0,
+                "relaxed_tp": 0,
+                "relaxed_tn": 0,
+                "relaxed_fp": 0,
+                "relaxed_fn": 0
             }
-        self.log("test_acc", result["accuracy"], sync_dist=True)
-        self.log("test_bacc", result["balanced_accuracy"], sync_dist=True)
-        self.log("test_pr_auc", result["pr_auc"], sync_dist=True)
-        self.log("test_auroc", result["roc_auc"], sync_dist=True)
-        self.log("test_f1", result["f1"], sync_dist=True)
-        self.custom_logger.info(f"Test metrics: {result}")
         
-        return result
+        # Log all metrics for TensorBoard
+        self.log("test_acc", metrics["accuracy"], sync_dist=True)
+        self.log("test_bacc", metrics["balanced_accuracy"], sync_dist=True)
+        self.log("test_pr_auc", metrics["pr_auc"], sync_dist=True)
+        self.log("test_auroc", metrics["roc_auc"], sync_dist=True)
+        self.log("test_f1", metrics["f1"], sync_dist=True)
+        self.log("test_precision", metrics["precision"], sync_dist=True)
+        self.log("test_recall", metrics["recall"], sync_dist=True)
+        
+        # Log confusion matrix metrics
+        self.log("test_true_positives", metrics["true_positives"], sync_dist=True)
+        self.log("test_false_positives", metrics["false_positives"], sync_dist=True)
+        self.log("test_true_negatives", metrics["true_negatives"], sync_dist=True)
+        self.log("test_false_negatives", metrics["false_negatives"], sync_dist=True)
+        
+        # Log relaxed metrics
+        self.log("test_relaxed_f1", metrics["relaxed_f1"], sync_dist=True)
+        self.log("test_relaxed_precision", metrics["relaxed_precision"], sync_dist=True)
+        self.log("test_relaxed_recall", metrics["relaxed_recall"], sync_dist=True)
+        self.log("test_relaxed_sensitivity", metrics["relaxed_sensitivity"], sync_dist=True)
+        self.log("test_relaxed_specificity", metrics["relaxed_specificity"], sync_dist=True)
+        self.log("test_relaxed_accuracy", metrics["relaxed_accuracy"], sync_dist=True)
+        
+        # Log detailed results
+        confusion_matrix_str = f"""
+        Confusion Matrix:
+        ┌───────────────┬────────────────┬────────────────┐
+        │               │ Predicted +ve  │ Predicted -ve  │
+        ├───────────────┼────────────────┼────────────────┤
+        │ Actual +ve    │ {metrics['true_positives']} (TP)    │ {metrics['false_negatives']} (FN)    │
+        ├───────────────┼────────────────┼────────────────┤
+        │ Actual -ve    │ {metrics['false_positives']} (FP)    │ {metrics['true_negatives']} (TN)    │
+        └───────────────┴────────────────┴────────────────┘
+        
+        Relaxed Confusion Matrix:
+        ┌───────────────┬────────────────┬────────────────┐
+        │               │ Predicted +ve  │ Predicted -ve  │
+        ├───────────────┼────────────────┼────────────────┤
+        │ Actual +ve    │ {metrics['relaxed_tp']} (TP)    │ {metrics['relaxed_fn']} (FN)    │
+        ├───────────────┼────────────────┼────────────────┤
+        │ Actual -ve    │ {metrics['relaxed_fp']} (FP)    │ {metrics['relaxed_tn']} (TN)    │
+        └───────────────┴────────────────┴────────────────┘
+        """
+        
+        self.custom_logger.info(f"Test metrics:")
+        self.custom_logger.info(f"Standard metrics: {metrics}")
+        self.custom_logger.info(confusion_matrix_str)
+        
+        return metrics
 
     def configure_optimizers(self):
         """Configure optimizer for training.
@@ -582,7 +733,7 @@ def supervised(args):
     lightning_model = LitModel_finetune.load_from_checkpoint(args.pretrain_model_path, args=args, model=model) if args.pretrain_model_path else LitModel_finetune(args, model)
 
     # Logger and callbacks
-    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
+    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{args.sample_length}-{args.epochs}-{timestamp}"
     tensorboard_logger = TensorBoardLogger(
         save_dir=args.model_log_dir,
         version=version,
@@ -618,7 +769,7 @@ def supervised(args):
     )
 
     trainer = pl.Trainer(
-        devices=args.gpus,
+        devices=[int(str_id) for str_id in args.gpus if str_id.isdigit()],
         accelerator="auto",
         strategy=DDPStrategy(find_unused_parameters=True),
         benchmark=True,
@@ -634,6 +785,14 @@ def supervised(args):
         lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
     )
     logger.info("Training completed")
+
+    # Test with pretrained model
+    if args.pretrain_model_path:
+        path = args.pretrain_model_path
+        logger.info(f"Testing pretrained model: {path}")
+        result = trainer.test(model=lightning_model, ckpt_path=path, dataloaders=test_loader)[0]
+        logger.info(f"Pretrained model test results:")
+        logger.info(f"{result}")
 
     # Test with the best models
     logger.info("Testing with best models...")
