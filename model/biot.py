@@ -237,26 +237,17 @@ class PositionalEncoding(nn.Module):
         pe (torch.Tensor): Precomputed positional encoding. (registered as to not be a model parameter)
     """
     
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000, 
-                 log_dir: Optional[str] = None):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000):
         """Initialize the positional encoding.
         
         Args:
             d_model: Dimensionality of the model.
             dropout: Dropout rate.
             max_len: Maximum sequence length.
-            log_dir: Optional directory for log files. If None, logs to console only.
         """
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         self.logger = logging.getLogger(__name__ + ".PositionalEncoding")
-        
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "positional_encoding.log"))
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(file_handler)
-            
         self.logger.debug(f"Initialized with d_model={d_model}, dropout={dropout}, max_len={max_len}")
 
         # Compute the positional encodings once in log space.
@@ -356,9 +347,7 @@ class BIOTEncoder(nn.Module):
         )
 
         # Add the patch time embedding for raw data
-        self.patch_time_embedding = PatchTimeEmbedding(
-            emb_size=emb_size, patch_size=patch_size, overlap=overlap, log_dir=log_dir
-        )
+        self.patch_time_embedding = PatchTimeEmbedding(emb_size=emb_size, patch_size=patch_size, overlap=overlap)
 
         self.transformer = LinearAttentionTransformer(
             dim=emb_size,
@@ -368,7 +357,7 @@ class BIOTEncoder(nn.Module):
             attn_layer_dropout=0.2,  # dropout right after self-attention layer
             attn_dropout=0.2,  # dropout post-attention
         )
-        self.positional_encoding = PositionalEncoding(emb_size, log_dir=log_dir)
+        self.positional_encoding = PositionalEncoding(emb_size)
 
         # Channel token, N_channels >= your actual channels
         self.channel_tokens = nn.Embedding(n_channels, 256)
