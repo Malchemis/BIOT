@@ -33,7 +33,7 @@ class MEGDataset(torch.utils.data.Dataset):
         
         Returns:
             Tuple of (data, labels) where:
-            - data has shape (n_channels, chunk_size, n_samples_per_clip)
+            - data has shape (n_channels, chunk_size * n_samples_per_clip)
             - labels has shape (chunk_size)
         """
         file_path = os.path.join(self.root, self.files[idx])
@@ -81,8 +81,11 @@ class MEGDataset(torch.utils.data.Dataset):
             else:
                 labels = label
 
-        # always return (data, labels) tuple as (n_channels, n_segments, n_samples_per_clip), (chunk_size)
-        return data.permute(1, 0, 2), labels
+        # always return (data, labels) tuple as (n_channels, n_segments * n_samples_per_clip), (chunk_size)
+        data = data.permute(1, 0, 2)
+        # unconcatenate the data so that it is (n_channels, chunk_size * n_samples_per_clip) but with temporal information preserved
+        data = data.reshape(data.shape[0], -1)
+        return data, labels
 
 
 class TUABLoader(torch.utils.data.Dataset):
@@ -972,25 +975,35 @@ def weighted_BCE(y_hat: torch.Tensor, y: torch.Tensor, class_weights: Dict[int, 
 
 
 def BCE(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Calculate binary cross-entropy loss.
+    """Calculate binary cross-entropy loss for multi-segment output.
     
-    This implementation is numerically stable.
+    This implementation is numerically stable and handles multi-segment predictions.
     
     Args:
-        y_hat: Predicted values (batch_size, chunk_size, N_classes, 1)
-        y: True values (batch_size, chunk_size, N_classes, 1)
+        y_hat: Predicted logits (batch_size, n_segments, n_classes) or (batch_size, n_classes)
+        y: True labels (batch_size, n_segments) or (batch_size)
         
     Returns:
         Calculated BCE loss
     """
-    y_hat = y_hat.view(-1, 1) # flatten: this reshapes to (batch_size * chunk_size * N_classes, 1)
-    y = y.view(-1, 1) # same
+    # Handle multi-segment output (batch_size, n_segments, n_classes)
+    if len(y_hat.shape) == 3:
+        # Reshape to (batch_size * n_segments, n_classes)
+        y_hat = y_hat.reshape(-1, y_hat.shape[-1])
+        # Reshape labels to (batch_size * n_segments)
+        y = y.reshape(-1)
+    
+    # Now handle as standard classification (batch_size, n_classes)
+    y_hat = y_hat.view(-1, 1)  # (batch_size, 1) or (batch_size * n_segments, 1)
+    y = y.view(-1, 1)  # (batch_size, 1) or (batch_size * n_segments, 1)
+    
     # BCE with logits loss
     loss = (
         -y * y_hat
         + torch.log(1 + torch.exp(-torch.abs(y_hat)))
         + torch.max(y_hat, torch.zeros_like(y_hat))
     )
+    
     return loss.mean()
 
 

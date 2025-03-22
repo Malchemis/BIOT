@@ -17,7 +17,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
-from model import BIOTClassifier
+from model import BIOTSequenceClassifier
 from utils import MEGDataset, BCE#, relaxed_scores
 
 import torch
@@ -90,10 +90,13 @@ class LitModel_finetune(pl.LightningModule):
         result = np.array([])
         gt = np.array([])
         for out in val_step_outputs:
-            result = np.append(result, out[0])
-            gt = np.append(gt, out[1])
+            result = np.append(result, out[0].flatten())
+            gt = np.append(gt, out[1].flatten())
 
-        if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 cases
+        num_positives = np.sum(gt)
+        num_negatives = len(gt) - num_positives
+        self.custom_logger.debug(f"Number of positives: {num_positives}, Number of negatives: {num_negatives}")
+        if num_positives * num_negatives != 0:  # to prevent all 0 or all 1 cases
             # Get precision, recall, and thresholds from precision-recall curve
             precision, recall, pr_thresholds = precision_recall_curve(gt, result)
 
@@ -120,6 +123,7 @@ class LitModel_finetune(pl.LightningModule):
             self.log("val_f1_standard", standard_metrics["f1"], sync_dist=True)
             self.log("val_acc_standard", standard_metrics["accuracy"], sync_dist=True)
         else:
+            self.custom_logger.info(f"Could not compute metrics as the ground truth is all 0 or all 1")
             result_metrics = {
                 "accuracy": 0.0, "balanced_accuracy": 0.0, "pr_auc": 0.0,
                 "roc_auc": 0.0, "f1": 0.0,
@@ -167,12 +171,15 @@ class LitModel_finetune(pl.LightningModule):
         gt = np.array([])
         
         for out in test_step_outputs:
-            result = np.append(result, out[0])
-            gt = np.append(gt, out[1])
+            result = np.append(result, out[0].flatten())
+            gt = np.append(gt, out[1].flatten())
         
         # Convert continuous predictions to binary using the best threshold
         binary_pred = (result >= self.threshold).astype(int)
-        if sum(gt) * (len(gt) - sum(gt)) != 0:
+        num_positives = np.sum(gt)
+        num_negatives = len(gt) - num_positives
+        self.custom_logger.debug(f"Number of positives: {num_positives}, Number of negatives: {num_negatives}")
+        if num_positives * num_negatives != 0:  # to prevent all 0 or all 1 cases
             # Standard metrics
             metrics = binary_metrics_fn(gt, result,
                 metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
@@ -188,6 +195,7 @@ class LitModel_finetune(pl.LightningModule):
             for key, value in zip(["true_positives", "false_positives", "true_negatives", "false_negatives"], [tp, fp, tn, fn]):
                 metrics[key] = int(value)
         else:
+            self.custom_logger.info(f"Could not compute metrics as the ground truth is all 0 or all 1")
             # Default metrics for one-class case
             metrics = {
                 "accuracy": 0.0, "balanced_accuracy": 0.0, "pr_auc": 0.0, "roc_auc": 0.0, 
@@ -228,11 +236,11 @@ class LitModel_finetune(pl.LightningModule):
         )
 
         # Learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=5
-        )
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer, mode="max", factor=0.5, patience=5
+        # )
 
-        return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "val_pr_auc"}
+        return {"optimizer": optimizer}#, "lr_scheduler": scheduler, "monitor": "val_pr_auc"}
 
 
 def seed_worker(worker_id):
@@ -315,7 +323,7 @@ def prepare_meg_dataloader(args):
     for _, (X, y) in enumerate(test_loader):
         logger.info(f"Test loader: {X.shape}, {y.shape}")
         break
-    return train_loader, test_loader, val_loader
+    return train_loader, test_loader, val_loader, X.shape, y.shape
 
 
 def supervised(args):
@@ -337,16 +345,18 @@ def supervised(args):
     # Get data loaders
     logger.info(f"Preparing data loaders for dataset: {args.dataset}")
     if args.dataset == "MEG":
-        train_loader, test_loader, val_loader = prepare_meg_dataloader(args)
+        train_loader, test_loader, val_loader, input_shape, output_shape = prepare_meg_dataloader(args)
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented")
 
     # Define the model
     logger.info(f"Initializing model: {args.model}")
     if args.model == "BIOT":
-        model = BIOTClassifier(
+        model = BIOTSequenceClassifier(
+            n_classes=1,
             n_channels=args.in_channels,
-            chunk_size=args.chunk_size,
+            n_segments=output_shape[1], # shape 0 is batch size, 1 is number of segments=chunk_size
+            seq_method='lstm', # 'lstm', 'attention', 'gating'
             n_fft=args.token_size,
             hop_length=args.hop_length,
             raw=args.raw, 
@@ -522,7 +532,6 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="BIOT", choices=["BIOT",],
                         help="which supervised model to use")
     parser.add_argument("--in_channels", type=int, default=16, help="number of input channels")
-    parser.add_argument("--chunk_size", type=int, default=100, help="number of segments/labels per chunk")
     parser.add_argument("--sampling_rate", type=int, default=200, help="sampling rate (r)")
     parser.add_argument("--token_size", type=int, default=200, help="token size (t)")
     parser.add_argument("--hop_length", type=int, default=100, help="token hop length (t - p)")
