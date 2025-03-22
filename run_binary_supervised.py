@@ -10,9 +10,6 @@ from datetime import datetime
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 
-import torch
-import numpy as np
-
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
@@ -20,83 +17,13 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
-from model import (
-    SPaRCNet,
-    ContraWR,
-    CNNTransformer,
-    FFCL,
-    STTransformer,
-    BIOTClassifier,
-)
-from utils import MEGDataset, TUABLoader, CHBMITLoader, PTBLoader, focal_loss, focal_loss_with_class_weights, BCE, weighted_BCE
+from model import BIOTClassifier
+from utils import MEGDataset, BCE#, relaxed_scores
 
 import torch
 import numpy as np
-from sklearn.metrics import precision_score, recall_score, confusion_matrix, f1_score, accuracy_score
+from sklearn.metrics import precision_score, recall_score, confusion_matrix#, f1_score, accuracy_score
 
-def relaxed_scores(true, pred):
-    """
-    Calculate relaxed metrics allowing detections to be 1 window away from the ground truth.
-    
-    Args:
-        true: Array of ground truth labels
-        pred: Array of predictions
-        
-    Returns:
-        Dictionary containing relaxed metrics
-    """
-    relaxed_pred = np.zeros_like(pred)
-
-    for ind, l in enumerate(true):
-        # Left boundary condition
-        if ind == 0:
-            if l == 1:
-                if (pred[ind] == 1 or pred[ind+1] == 1):
-                    relaxed_pred[ind] = 1
-            elif pred[ind] == 1 and true[ind+1] == 0:
-                relaxed_pred[ind] = 1
-        # Right boundary condition
-        elif ind == true.shape[0] - 1:
-            if l == 1:
-                if (pred[ind] == 1 or pred[ind-1] == 1):
-                    relaxed_pred[ind] = 1
-            elif pred[ind] == 1 and true[ind-1] == 0:
-                relaxed_pred[ind] = 1        
-        # General case
-        elif l == 1:
-            if (pred[ind-1] == 1 or pred[ind] == 1 or pred[ind+1] == 1):
-                relaxed_pred[ind] = 1
-        elif pred[ind] == 1 and true[ind+1] == 0 and true[ind-1] == 0:
-            relaxed_pred[ind] = 1
-
-    # Calculate relaxed metrics
-    relaxed_tp = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 1)))
-    relaxed_tn = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 0)))
-    relaxed_fp = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 1)))
-    relaxed_fn = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 0)))
-    
-    # Calculate metrics, handling edge cases
-    relaxed_f1 = (2*relaxed_tp)/(2*relaxed_tp+relaxed_fp+relaxed_fn) if (2*relaxed_tp+relaxed_fp+relaxed_fn) else 1
-    relaxed_precision = (relaxed_tp / (relaxed_tp+relaxed_fp)) if (relaxed_tp+relaxed_fp) else 1
-    relaxed_recall = relaxed_sens = (relaxed_tp / (relaxed_tp+relaxed_fn)) if (relaxed_tp+relaxed_fn) else 1
-    relaxed_spec = (relaxed_tn / (relaxed_tn+relaxed_fp)) if (relaxed_tn+relaxed_fp) else 1
-    relaxed_acc = (relaxed_tp + relaxed_tn) / (relaxed_tp + relaxed_tn + relaxed_fp + relaxed_fn)
-    
-    # Create a dictionary of relaxed metrics
-    relaxed_metrics = {
-        "relaxed_f1": relaxed_f1,
-        "relaxed_precision": relaxed_precision,
-        "relaxed_recall": relaxed_recall,
-        "relaxed_sensitivity": relaxed_sens,
-        "relaxed_specificity": relaxed_spec,
-        "relaxed_accuracy": relaxed_acc,
-        "relaxed_tp": relaxed_tp,
-        "relaxed_tn": relaxed_tn,
-        "relaxed_fp": relaxed_fp,
-        "relaxed_fn": relaxed_fn
-    }
-    
-    return relaxed_metrics
 
 class LitModel_finetune(pl.LightningModule):
     def __init__(self, args: argparse.Namespace, model):
@@ -107,116 +34,87 @@ class LitModel_finetune(pl.LightningModule):
         self.validation_step_outputs = []
         self.test_step_outputs = []
         self.custom_logger = logging.getLogger(__name__)
-        
-        # Determine if we're using chunk-based output mode
-        self.chunk_mode = hasattr(self.model, 'return_sequences') and self.model.return_sequences
 
     def training_step(self, batch, batch_idx):
         """Perform a single training step.
-        
-        Handles both single-output and multi-output (chunk) mode.
+
+        Args:
+            batch: A batch of data (inputs and targets)
+            batch_idx: Index of the batch
+
+        Returns:
+            The calculated loss
         """
         X, y = batch
-        
-        # Forward pass through the model
         prob = self.model(X)
-        
-        if self.chunk_mode:
-            # In chunk mode, prob is [batch, chunk_size, n_classes]
-            # and y is either [batch, chunk_size] or [batch, 1]
-            
-            # Check if y is already in the right shape, if not reshape it
-            if y.dim() == 2 and y.shape[1] == prob.shape[1]:
-                # y is already [batch, chunk_size]
-                chunk_y = y
-            else:
-                # Assume y is [batch, 1] and we need to expand it to match the chunks
-                chunk_y = y.repeat(1, prob.shape[1])
-            
-            # Flatten both predictions and labels for loss calculation
-            # [batch, chunk_size, n_classes] -> [batch*chunk_size, n_classes]
-            flat_prob = prob.reshape(-1, prob.shape[-1])
-            # [batch, chunk_size] -> [batch*chunk_size]
-            flat_y = chunk_y.reshape(-1)
-            
-            # Calculate loss on flattened predictions and labels
-            loss = BCE(flat_prob, flat_y)
-        else:
-            # Standard single-output mode
-            loss = BCE(prob, y)
-        
+
+        # Option 1: Original BCE loss (no weighting)
+        loss = BCE(prob, y)
+        # Option 2: Weighted BCE with class-specific weights
+        # loss = weighted_BCE(prob, y, self.class_weights)
+        # Option 3: Original focal loss
+        # loss = focal_loss(prob, y, alpha=0.8, gamma=0.7)
+        # Option 4: Focal loss with class weights
+        # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Perform a single validation step, collecting probabilities for metrics calculation.
-        
-        Handles both single-output and multi-output (chunk) mode.
+        """Perform a single validation step.
+
+        Args:
+            batch: A batch of data (inputs and targets)
+            batch_idx: Index of the batch
+
+        Returns:
+            Tuple of predictions and ground truth
         """
         X, y = batch
         with torch.no_grad():
             prob = self.model(X)
-            
-            if self.chunk_mode:
-                # In chunk mode, prob is [batch, chunk_size, n_classes]
-                
-                # Check if y is in the right shape
-                if y.dim() == 2 and y.shape[1] == prob.shape[1]:
-                    # y is already [batch, chunk_size]
-                    chunk_y = y
-                else:
-                    # Expand y to match chunks
-                    chunk_y = y.repeat(1, prob.shape[1])
-                
-                # Convert to probabilities
-                step_probs = torch.sigmoid(prob)  # Still [batch, chunk_size, n_classes]
-                
-                # We'll collect all individual segment predictions for metrics
-                # Reshape to [batch*chunk_size, n_classes]
-                flat_probs = step_probs.reshape(-1, step_probs.shape[-1]).cpu().numpy()
-                flat_y = chunk_y.reshape(-1).cpu().numpy()
-                
-                self.validation_step_outputs.append((flat_probs, flat_y))
-            else:
-                # Standard single-output mode
-                step_probs = torch.sigmoid(prob).cpu().numpy()
-                step_gt = y.cpu().numpy()
-                self.validation_step_outputs.append((step_probs, step_gt))
-        
-        return prob, y
+            step_result = torch.sigmoid(prob).cpu().numpy()
+            step_gt = y.cpu().numpy()
+        # Append the result to the list
+        self.validation_step_outputs.append((step_result, step_gt))
+        return step_result, step_gt
+
+    def on_validation_epoch_start(self):
+        """Initialize validation outputs collection at the start of validation."""
+        self.validation_step_outputs = []
 
     def on_validation_epoch_end(self):
-        """Calculate validation metrics.
-        
-        Works with both single-output and multi-output (chunk) mode.
-        """
+        """Process validation outputs at the end of validation epoch with scikit-learn optimized threshold."""
         from sklearn.metrics import precision_recall_curve
-        
+
         val_step_outputs = self.validation_step_outputs
         result = np.array([])
         gt = np.array([])
-        
         for out in val_step_outputs:
             result = np.append(result, out[0])
             gt = np.append(gt, out[1])
 
         if sum(gt) * (len(gt) - sum(gt)) != 0:  # to prevent all 0 or all 1 cases
-            # Find optimal threshold using PR curve
+            # Get precision, recall, and thresholds from precision-recall curve
             precision, recall, pr_thresholds = precision_recall_curve(gt, result)
+
+            # Calculate F1 score for each threshold
+            # Convert to list and handle the case where pr_thresholds has one less element than precision/recall
             pr_thresholds = np.append(pr_thresholds, 1.0)
             f1_scores = [2 * p * r / (p + r + 1e-10) for p, r in zip(precision, recall)]
+
+            # Find threshold with highest F1 score
             best_idx = np.argmax(f1_scores)
             self.threshold = pr_thresholds[best_idx]
-            
-            # Calculate metrics
-            result_metrics = binary_metrics_fn(
-                gt, result, metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
+
+            # Calculate and log metrics using the selected threshold
+            result_metrics = binary_metrics_fn(gt, result,
+                metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
-            
-            # Log standard threshold metrics for comparison
-            standard_metrics = binary_metrics_fn(
-                gt, result, metrics=["accuracy", "balanced_accuracy", "f1"],
+
+            # Additional insight: log the performance at a standard 0.5 threshold for comparison
+            standard_metrics = binary_metrics_fn(gt, result,
+                metrics=["accuracy", "balanced_accuracy", "f1"],
                 threshold=0.5,
             )
             self.log("val_f1_standard", standard_metrics["f1"], sync_dist=True)
@@ -232,45 +130,32 @@ class LitModel_finetune(pl.LightningModule):
         for key, value in result_metrics.items():
             self.log(f"val_{key}", value, sync_dist=True)
         self.log("best_threshold", self.threshold, sync_dist=True)
-        
+
         self.custom_logger.info(f"Validation metrics: {result_metrics}")
         self.custom_logger.info(f"Optimal threshold: {self.threshold:.4f}")
 
     def test_step(self, batch, batch_idx):
-        """Perform a single test step, collecting probabilities for metrics calculation.
-        
-        Handles both single-output and multi-output (chunk) mode.
+        """Perform a single test step.
+
+        Args:
+            batch: A batch of data (inputs and targets)
+            batch_idx: Index of the batch
+
+        Returns:
+            Tuple of predictions and ground truth
         """
         X, y = batch
         with torch.no_grad():
-            prob = self.model(X)
-            
-            if self.chunk_mode:
-                # In chunk mode, prob is [batch, chunk_size, n_classes]
-                
-                # Check if y is in the right shape
-                if y.dim() == 2 and y.shape[1] == prob.shape[1]:
-                    # y is already [batch, chunk_size]
-                    chunk_y = y
-                else:
-                    # Expand y to match chunks
-                    chunk_y = y.repeat(1, prob.shape[1])
-                
-                # Convert to probabilities
-                step_probs = torch.sigmoid(prob)  # [batch, chunk_size, n_classes]
-                
-                # Collect all segment predictions
-                flat_probs = step_probs.reshape(-1, step_probs.shape[-1]).cpu().numpy()
-                flat_y = chunk_y.reshape(-1).cpu().numpy()
-                
-                self.test_step_outputs.append((flat_probs, flat_y))
-            else:
-                # Standard single-output mode
-                step_probs = torch.sigmoid(prob).cpu().numpy()
-                step_gt = y.cpu().numpy()
-                self.test_step_outputs.append((step_probs, step_gt))
-        
-        return prob, y
+            convScore = self.model(X)
+            step_result = torch.sigmoid(convScore).cpu().numpy()
+            step_gt = y.cpu().numpy()
+        # Append to the test outputs list
+        self.test_step_outputs.append((step_result, step_gt))
+        return step_result, step_gt
+
+    def on_test_epoch_start(self):
+        """Initialize test outputs collection at the start of testing."""
+        self.test_step_outputs = []
 
     def on_test_epoch_end(self):
         """Calculate test metrics including relaxed scores for spike detection.
@@ -287,12 +172,9 @@ class LitModel_finetune(pl.LightningModule):
         
         # Convert continuous predictions to binary using the best threshold
         binary_pred = (result >= self.threshold).astype(int)
-        
-        metrics = {}
         if sum(gt) * (len(gt) - sum(gt)) != 0:
             # Standard metrics
-            metrics = binary_metrics_fn(
-                gt, result,
+            metrics = binary_metrics_fn(gt, result,
                 metrics=["pr_auc", "roc_auc", "accuracy", "balanced_accuracy", "f1"],
                 threshold=self.threshold,
             )
@@ -303,24 +185,14 @@ class LitModel_finetune(pl.LightningModule):
             
             # Confusion matrix
             tn, fp, fn, tp = confusion_matrix(gt, binary_pred, labels=[0, 1]).ravel()
-            metrics["true_positives"] = int(tp)
-            metrics["false_positives"] = int(fp)
-            metrics["true_negatives"] = int(tn)
-            metrics["false_negatives"] = int(fn)
-            
-            # Relaxed scores
-            relaxed_metrics = relaxed_scores(gt, binary_pred)
-            metrics.update(relaxed_metrics)
-            
+            for key, value in zip(["true_positives", "false_positives", "true_negatives", "false_negatives"], [tp, fp, tn, fn]):
+                metrics[key] = int(value)
         else:
             # Default metrics for one-class case
             metrics = {
                 "accuracy": 0.0, "balanced_accuracy": 0.0, "pr_auc": 0.0, "roc_auc": 0.0, 
                 "f1": 0.0, "precision": 0.0, "recall": 0.0,
                 "true_positives": 0, "false_positives": 0, "true_negatives": 0, "false_negatives": 0,
-                "relaxed_f1": 0.0, "relaxed_precision": 0.0, "relaxed_recall": 0.0,
-                "relaxed_sensitivity": 0.0, "relaxed_specificity": 0.0, "relaxed_accuracy": 0.0,
-                "relaxed_tp": 0, "relaxed_tn": 0, "relaxed_fp": 0, "relaxed_fn": 0
             }
         
         # Log all metrics
@@ -333,25 +205,14 @@ class LitModel_finetune(pl.LightningModule):
         ┌───────────────┬────────────────┬────────────────┐
         │               │ Predicted +ve  │ Predicted -ve  │
         ├───────────────┼────────────────┼────────────────┤
-        │ Actual +ve    │ {metrics['true_positives']} (TP)    │ {metrics['false_negatives']} (FN)    │
+        │ Actual +ve    │ {metrics['true_positives']} (TP)        │ {metrics['false_negatives']} (FN)        │
         ├───────────────┼────────────────┼────────────────┤
-        │ Actual -ve    │ {metrics['false_positives']} (FP)    │ {metrics['true_negatives']} (TN)    │
-        └───────────────┴────────────────┴────────────────┘
-        
-        Relaxed Confusion Matrix:
-        ┌───────────────┬────────────────┬────────────────┐
-        │               │ Predicted +ve  │ Predicted -ve  │
-        ├───────────────┼────────────────┼────────────────┤
-        │ Actual +ve    │ {metrics['relaxed_tp']} (TP)    │ {metrics['relaxed_fn']} (FN)    │
-        ├───────────────┼────────────────┼────────────────┤
-        │ Actual -ve    │ {metrics['relaxed_fp']} (FP)    │ {metrics['relaxed_tn']} (TN)    │
+        │ Actual -ve    │ {metrics['false_positives']} (FP)        │ {metrics['true_negatives']} (TN)        │
         └───────────────┴────────────────┴────────────────┘
         """
         
-        self.custom_logger.info(f"Test metrics:")
-        self.custom_logger.info(f"Standard metrics: {metrics}")
+        self.custom_logger.info(f"Test metrics: {metrics}")
         self.custom_logger.info(confusion_matrix_str)
-        
         return metrics
 
     def configure_optimizers(self):
@@ -366,7 +227,12 @@ class LitModel_finetune(pl.LightningModule):
             weight_decay=self.args.weight_decay,
         )
 
-        return [optimizer]  # , [scheduler]
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=5, verbose=True
+        )
+
+        return [optimizer], [scheduler]
 
 
 def seed_worker(worker_id):
@@ -381,7 +247,7 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def prepare_custom_dataloader(args):
+def prepare_meg_dataloader(args):
     """Prepare dataloaders for MEG dataset.
     
     Args:
@@ -414,7 +280,7 @@ def prepare_custom_dataloader(args):
 
     # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "train"), train_files, chunk_mode=args.chunk_mode),
+        MEGDataset(os.path.join(root, "train"), train_files),
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
@@ -423,7 +289,7 @@ def prepare_custom_dataloader(args):
         worker_init_fn=seed_worker
     )
     test_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "test"), test_files, chunk_mode=args.chunk_mode),
+        MEGDataset(os.path.join(root, "test"), test_files),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -431,7 +297,7 @@ def prepare_custom_dataloader(args):
         worker_init_fn=seed_worker
     )
     val_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "val"), val_files, chunk_mode=args.chunk_mode),
+        MEGDataset(os.path.join(root, "val"), val_files),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -449,173 +315,6 @@ def prepare_custom_dataloader(args):
     for _, (X, y) in enumerate(test_loader):
         logger.info(f"Test loader: {X.shape}, {y.shape}")
         break
-    return train_loader, test_loader, val_loader
-
-
-def prepare_TUAB_dataloader(args):
-    """Prepare dataloaders for TUAB dataset.
-    
-    Args:
-        args: Command-line arguments containing dataset parameters
-        
-    Returns:
-        Tuple of train, test, and validation data loaders
-    """
-    # Set random seed for reproducibility
-    seed = args.seed
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-
-    logger = logging.getLogger(__name__)
-    
-    # Use the specified data root path
-    root = os.path.join(args.data_dir, "tuh_eeg_abnormal/v3.0.0/edf/processed")
-
-    train_files = os.listdir(os.path.join(root, "train"))
-    np.random.shuffle(train_files)
-    val_files = os.listdir(os.path.join(root, "val"))
-    test_files = os.listdir(os.path.join(root, "test"))
-
-    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
-
-    # Prepare training and test data loader
-    train_loader = torch.utils.data.DataLoader(
-        TUABLoader(os.path.join(root, "train"),
-                   train_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        TUABLoader(os.path.join(root, "test"), test_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        TUABLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
-    return train_loader, test_loader, val_loader
-
-
-def prepare_CHB_MIT_dataloader(args):
-    """Prepare dataloaders for CHB-MIT dataset.
-    
-    Args:
-        args: Command-line arguments containing dataset parameters
-        
-    Returns:
-        Tuple of train, test, and validation data loaders
-    """
-    # Set random seed for reproducibility
-    seed = args.seed
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-
-    logger = logging.getLogger(__name__)
-    
-    # Use the specified data root path
-    root = os.path.join(args.data_dir, "physionet.org/files/chbmit/1.0.0/clean_segments")
-
-    train_files = os.listdir(os.path.join(root, "train"))
-    val_files = os.listdir(os.path.join(root, "val"))
-    test_files = os.listdir(os.path.join(root, "test"))
-
-    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
-
-    # Prepare training and test data loader
-    train_loader = torch.utils.data.DataLoader(
-        CHBMITLoader(os.path.join(root, "train"),
-                     train_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        CHBMITLoader(os.path.join(root, "test"),
-                     test_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        CHBMITLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
-    return train_loader, test_loader, val_loader
-
-
-def prepare_PTB_dataloader(args):
-    """Prepare dataloaders for PTB dataset.
-    
-    Args:
-        args: Command-line arguments containing dataset parameters
-        
-    Returns:
-        Tuple of train, test, and validation data loaders
-    """
-    # Set random seed for reproducibility
-    seed = args.seed
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-
-    logger = logging.getLogger(__name__)
-    
-    # Use the specified data root path
-    root = os.path.join(args.data_dir, "WFDB/processed2")
-
-    train_files = os.listdir(os.path.join(root, "train"))
-    val_files = os.listdir(os.path.join(root, "val"))
-    test_files = os.listdir(os.path.join(root, "test"))
-
-    logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
-
-    # Prepare training and test data loader
-    train_loader = torch.utils.data.DataLoader(
-        PTBLoader(os.path.join(root, "train"),
-                  train_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        PTBLoader(os.path.join(root, "test"), test_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        PTBLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-    )
-    logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
     return train_loader, test_loader, val_loader
 
 
@@ -638,84 +337,22 @@ def supervised(args):
     # Get data loaders
     logger.info(f"Preparing data loaders for dataset: {args.dataset}")
     if args.dataset == "MEG":
-        train_loader, test_loader, val_loader = prepare_custom_dataloader(args)
-    elif args.dataset == "TUAB":
-        train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
-    elif args.dataset == "CHB-MIT":
-        train_loader, test_loader, val_loader = prepare_CHB_MIT_dataloader(args)
-    elif args.dataset == "PTB":
-        train_loader, test_loader, val_loader = prepare_PTB_dataloader(args)
+        train_loader, test_loader, val_loader = prepare_meg_dataloader(args)
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented")
 
     # Define the model
     logger.info(f"Initializing model: {args.model}")
-    if args.model == "SPaRCNet":
-        model = SPaRCNet(
-            in_channels=args.in_channels,
-            sample_length=int(args.sampling_rate * args.sample_length),
-            n_classes=args.n_classes,
-            block_layers=4,
-            growth_rate=16,
-            bn_size=16,
-            drop_rate=0.5,
-            conv_bias=True,
-            batch_norm=True,
-        )
-
-    elif args.model == "ContraWR":
-        model = ContraWR(
-            in_channels=args.in_channels,
-            n_classes=args.n_classes,
-            fft=args.token_size,
-            steps=args.hop_length // 5,
-        )
-
-    elif args.model == "CNNTransformer":
-        model = CNNTransformer(
-            in_channels=args.in_channels,
-            n_classes=args.n_classes,
-            fft=args.sampling_rate,
-            steps=args.hop_length // 5,
-            dropout=0.2,
-            nhead=4,
-            emb_size=256,
-        )
-
-    elif args.model == "FFCL":
-        model = FFCL(
-            in_channels=args.in_channels,
-            n_classes=args.n_classes,
-            fft=args.token_size,
-            steps=args.hop_length // 5,
-            sample_length=int(args.sampling_rate * args.sample_length),
-            shrink_steps=20,
-        )
-
-    elif args.model == "STTransformer":
-        model = STTransformer(
-            emb_size=256,
-            depth=4,
-            n_classes=args.n_classes,
-            channel_legnth=int(
-                args.sampling_rate * args.sample_length
-            ),  # (sampling_rate * duration)
-            n_channels=args.in_channels,
-        )
-
-    elif args.model == "BIOT":
+    if args.model == "BIOT":
         model = BIOTClassifier(
-            n_classes=args.n_classes,
             n_channels=args.in_channels,
+            chunk_size=args.chunk_size,
             n_fft=args.token_size,
             hop_length=args.hop_length,
             raw=args.raw, 
             patch_size=args.patch_size, 
             overlap=args.overlap,
-            chunk_size=args.chunk_size,  # Pass chunk_size parameter
-            return_sequences=args.chunk_mode,  # Enable sequence return mode based on argument
         )
-
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
         
@@ -878,19 +515,14 @@ if __name__ == "__main__":
     parser.add_argument("--gpus", type=list, default=[0], help="GPU devices to use")
     
     # Dataset parameters
-    parser.add_argument("--dataset", type=str, default="MEG", 
-                        choices=["MEG", "TUAB", "CHB-MIT", "PTB"],
+    parser.add_argument("--dataset", type=str, default="MEG", choices=["MEG",],
                         help="which dataset to use")
-    parser.add_argument("--chunk_mode", action="store_true", 
-                    help="Enable chunk mode for multi-segment prediction")
     
     # Model parameters
-    parser.add_argument("--model", type=str, default="SPaRCNet", 
-                       choices=["SPaRCNet", "ContraWR", "CNNTransformer", "FFCL", "STTransformer", "BIOT"],
-                       help="which supervised model to use")
+    parser.add_argument("--model", type=str, default="BIOT", choices=["BIOT",],
+                        help="which supervised model to use")
     parser.add_argument("--in_channels", type=int, default=16, help="number of input channels")
-    parser.add_argument("--sample_length", type=float, default=10, help="length (s) of sample")
-    parser.add_argument("--n_classes", type=int, default=1, help="number of output classes")
+    parser.add_argument("--chunk_size", type=int, default=100, help="number of segments/labels per chunk")
     parser.add_argument("--sampling_rate", type=int, default=200, help="sampling rate (r)")
     parser.add_argument("--token_size", type=int, default=200, help="token size (t)")
     parser.add_argument("--hop_length", type=int, default=100, help="token hop length (t - p)")

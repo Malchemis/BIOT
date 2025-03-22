@@ -28,13 +28,13 @@ class MEGDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.files)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get a sample from the dataset.
         
         Returns:
             Tuple of (data, labels) where:
-            - data has shape (batch_size, chunk_size, n_channels, n_samples_per_clip)
-            - labels has shape (batch_size, chunk_size)
+            - data has shape (chunk_size, n_channels, n_samples_per_clip)
+            - labels has shape (chunk_size)
         """
         file_path = os.path.join(self.root, self.files[idx])
         sample = torch.load(file_path, map_location='cpu')
@@ -69,7 +69,7 @@ class MEGDataset(torch.utils.data.Dataset):
             label = sample['label']  # Scalar or 1D tensor with single value
             
             # Add chunk dimension (of size 1)
-            data = data.unsqueeze(0)  # Shape: (1, n_channels, n_samples)
+            data = data.unsqueeze(0)  # Shape: (chunk_size=1, n_channels, n_samples)
             
             # Convert label to tensor if needed
             if not isinstance(label, torch.Tensor):
@@ -80,7 +80,8 @@ class MEGDataset(torch.utils.data.Dataset):
                 labels = label.unsqueeze(0)  # Shape: (1)
             else:
                 labels = label
-        
+
+        # always return (data, labels) tuple as (chunk_size, n_channels, n_samples_per_clip), (chunk_size)
         return data, labels
 
 
@@ -976,17 +977,84 @@ def BCE(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     This implementation is numerically stable.
     
     Args:
-        y_hat: Predicted values (N, 1)
-        y: True values (N, 1)
+        y_hat: Predicted values (batch_size, chunk_size, N_classes, 1)
+        y: True values (batch_size, chunk_size, N_classes, 1)
         
     Returns:
         Calculated BCE loss
     """
-    y_hat = y_hat.view(-1, 1)
-    y = y.view(-1, 1)
+    y_hat = y_hat.view(-1, 1) # flatten: this reshapes to (batch_size * chunk_size * N_classes, 1)
+    y = y.view(-1, 1) # same
+    # BCE with logits loss
     loss = (
         -y * y_hat
         + torch.log(1 + torch.exp(-torch.abs(y_hat)))
         + torch.max(y_hat, torch.zeros_like(y_hat))
     )
     return loss.mean()
+
+
+def relaxed_scores(true, pred):
+    """
+    Calculate relaxed metrics allowing detections to be 1 window away from the ground truth.
+
+    Args:
+        true: Array of ground truth labels
+        pred: Array of predictions
+
+    Returns:
+        Dictionary containing relaxed metrics
+    """
+    relaxed_pred = np.zeros_like(pred)
+
+    for ind, l in enumerate(true):
+        # Left boundary condition
+        if ind == 0:
+            if l == 1:
+                if (pred[ind] == 1 or pred[ind + 1] == 1):
+                    relaxed_pred[ind] = 1
+            elif pred[ind] == 1 and true[ind + 1] == 0:
+                relaxed_pred[ind] = 1
+        # Right boundary condition
+        elif ind == true.shape[0] - 1:
+            if l == 1:
+                if (pred[ind] == 1 or pred[ind - 1] == 1):
+                    relaxed_pred[ind] = 1
+            elif pred[ind] == 1 and true[ind - 1] == 0:
+                relaxed_pred[ind] = 1
+                # General case
+        elif l == 1:
+            if (pred[ind - 1] == 1 or pred[ind] == 1 or pred[ind + 1] == 1):
+                relaxed_pred[ind] = 1
+        elif pred[ind] == 1 and true[ind + 1] == 0 and true[ind - 1] == 0:
+            relaxed_pred[ind] = 1
+
+    # Calculate relaxed metrics
+    relaxed_tp = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 1)))
+    relaxed_tn = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 0)))
+    relaxed_fp = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 1)))
+    relaxed_fn = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 0)))
+
+    # Calculate metrics, handling edge cases
+    relaxed_f1 = (2 * relaxed_tp) / (2 * relaxed_tp + relaxed_fp + relaxed_fn) if (
+                2 * relaxed_tp + relaxed_fp + relaxed_fn) else 1
+    relaxed_precision = (relaxed_tp / (relaxed_tp + relaxed_fp)) if (relaxed_tp + relaxed_fp) else 1
+    relaxed_recall = relaxed_sens = (relaxed_tp / (relaxed_tp + relaxed_fn)) if (relaxed_tp + relaxed_fn) else 1
+    relaxed_spec = (relaxed_tn / (relaxed_tn + relaxed_fp)) if (relaxed_tn + relaxed_fp) else 1
+    relaxed_acc = (relaxed_tp + relaxed_tn) / (relaxed_tp + relaxed_tn + relaxed_fp + relaxed_fn)
+
+    # Create a dictionary of relaxed metrics
+    relaxed_metrics = {
+        "relaxed_f1": relaxed_f1,
+        "relaxed_precision": relaxed_precision,
+        "relaxed_recall": relaxed_recall,
+        "relaxed_sensitivity": relaxed_sens,
+        "relaxed_specificity": relaxed_spec,
+        "relaxed_accuracy": relaxed_acc,
+        "relaxed_tp": relaxed_tp,
+        "relaxed_tn": relaxed_tn,
+        "relaxed_fp": relaxed_fp,
+        "relaxed_fn": relaxed_fn
+    }
+
+    return relaxed_metrics
