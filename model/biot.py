@@ -119,74 +119,76 @@ class PatchTimeEmbedding(nn.Module):
         return x
 
 class ChunkClassificationHead(nn.Module):
-    """Classification head for chunk-based processing with context awareness.
-    
-    This module takes embeddings from multiple segments in a chunk and produces
-    class probabilities for each segment, leveraging context from the entire chunk.
-    """
-    
-    def __init__(self, emb_size: int, chunk_size: int, mode: str = 'attention'):
-        """Initialize the chunk classification head.
-        
-        Args:
-            emb_size: Size of the input embedding.
-            chunk_size: Number of segments in each chunk.
-            mode: Context capturing mode ('independent', 'sequential', or 'attention').
-        """
+    def __init__(self, emb_size, chunk_size, mode='attention'):
         super().__init__()
-        self.logger = logging.getLogger(__name__ + ".ChunkClassificationHead")
-        self.logger.debug(f"Initialized with emb_size={emb_size}, mode={mode}")
-        
         self.mode = mode
         
-        # Different context-capturing mechanisms based on mode
         if mode == 'sequential':
-            # Bidirectional LSTM to capture sequential dependencies
+            # Bidirectional LSTM to capture temporal dependencies between segments
             self.context_layers = nn.LSTM(
                 input_size=emb_size,
-                hidden_size=emb_size // 2,  # Half size for bidirectional
-                num_layers=1,
+                hidden_size=emb_size // 2,
+                num_layers=2,  # Use 2 layers for better context modeling
                 batch_first=True,
-                bidirectional=True
+                bidirectional=True,
+                dropout=0.2
             )
         elif mode == 'attention':
-            # Self-attention to capture relationships between segments
+            # Multi-head self-attention to capture relationships between segments
             self.context_layers = nn.MultiheadAttention(
                 embed_dim=emb_size,
-                num_heads=4,
-                batch_first=True
+                num_heads=8,  # More heads for detailed attention
+                batch_first=True,
+                dropout=0.2
             )
-            # Add layer normalization and residual connection
-            self.norm = nn.LayerNorm(emb_size)
+            self.norm1 = nn.LayerNorm(emb_size)
+            
+            # Add feed-forward network after attention for better representation
+            self.feed_forward = nn.Sequential(
+                nn.Linear(emb_size, emb_size*4),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(emb_size*4, emb_size)
+            )
+            self.norm2 = nn.LayerNorm(emb_size)
         else:  # 'independent' mode
-            self.context_layers = nn.Identity()  # No context processing
+            self.context_layers = nn.Identity()
         
-        # Final classification layer
+        # Segment-wise classifier (applied to each segment separately)
         self.classifier = nn.Sequential(
-            nn.ELU(),
-            nn.Linear(emb_size, chunk_size) # 1 output for each segment in the chunk
+            nn.Dropout(0.2),
+            nn.Linear(emb_size, 1)  # Binary classification per segment
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the chunk classification head.
-        
+    def forward(self, x):
+        """
         Args:
-            x: Input embeddings tensor of shape (batch_size, emb_size)
+            x: Segment embeddings of shape (batch_size, chunk_size, emb_size)
             
         Returns:
-            Class logits of shape (batch_size, chunk_size)
+            Logits of shape (batch_size, chunk_size)
         """
         # Apply context-capturing layers based on mode
         if self.mode == 'sequential':
-            # Process with LSTM
             x, _ = self.context_layers(x)
         elif self.mode == 'attention':
             # Self-attention with residual connection and normalization
+            residual = x
             attn_output, _ = self.context_layers(x, x, x)
-            x = self.norm(x + attn_output)
+            x = self.norm1(residual + attn_output)
+            
+            # Feed-forward network with residual connection
+            residual = x
+            x = self.feed_forward(x)
+            x = self.norm2(residual + x)
 
-        # Outputs logits all at once by applying the classifier
-        return self.classifier(x)
+        # Reshape for segment-wise classification
+        batch_size, chunk_size, emb_size = x.shape
+        
+        # Apply classifier to each segment while preserving batch and segment dimensions
+        logits = self.classifier(x.view(-1, emb_size)).view(batch_size, chunk_size)
+        
+        return logits
 
 
 class ClassificationHead(nn.Sequential):
@@ -237,7 +239,7 @@ class PositionalEncoding(nn.Module):
         pe (torch.Tensor): Precomputed positional encoding. (registered as to not be a model parameter)
     """
     
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1200):
         """Initialize the positional encoding.
         
         Args:
@@ -385,61 +387,129 @@ class BIOTEncoder(nn.Module):
         )
         return torch.abs(spectral)
 
-    def forward(self, x: torch.Tensor, n_channel_offset: int = 0, perturb: bool = False) -> torch.Tensor:
-        """Forward pass of the BIOT encoder.
+    def forward(self, x, n_channel_offset=0, perturb=False):
+        """Forward pass that processes all segments together while preserving segment awareness.
         
         Args:
-            x: Input tensor of shape (batch_size, channel, ts).
-            n_channel_offset: Offset for channel tokens.
-            perturb: Whether to randomly perturb the sequence.
+            x: Input tensor of shape (batch_size, n_channels, n_segments, ts_per_segment)
+            n_channel_offset: Offset for channel tokens
+            perturb: Whether to randomly perturb the sequence
             
         Returns:
-            Encoded tensor of shape (batch_size, emb_size).
+            Segment-level embeddings of shape (batch_size, n_segments, emb_size)
         """
-        emb_seq = []
+        batch_size, n_channels, n_segments, ts_per_segment = x.shape
+        segment_embs = []
+        
         # For each channel
-        for i in range(x.shape[1]):
-            # Get the current channel data
-            channel_data = x[:, i:i + 1, :]
-
-            # Segmentation (shape goes from (batch, 1, ts) to (batch, ts, emb_size))
+        for i in range(n_channels):
+            # Process each segment within this channel
+            channel_data = x[:, i:i+1, :, :].reshape(batch_size, 1, n_segments * ts_per_segment)
+            
+            # Process either with time or frequency embeddings
             if self.raw:
-                # Raw time-series data processing
-                channel_emb = self.patch_time_embedding(channel_data)
+                # Process the entire sequence with segment boundaries preserved
+                channel_emb = self.patch_time_embedding(channel_data)  # (batch_size, n_patches, emb_size)
             else:
                 # Spectral data processing
-                channel_spec = self.stft(channel_data) # shape: batch, freq, ts
-                channel_emb = self.patch_frequency_embedding(channel_spec)
-
-            batch_size, ts, _ = channel_emb.shape
-
-            # Channel token embedding: We get the channel embedding, make it match the segment shape, and apply.
-            channel_token_emb = (
-                self.channel_tokens(
-                    self.index[i + n_channel_offset]
-                )
-                .unsqueeze(0) # shape from (emb) to (1, emb)
-                .unsqueeze(0) # (1, 1, emb)
-                .repeat(batch_size, ts, 1) # repeat the channel embedding for all corresponding segments
-            )
-
-            # Positional encoding
-            channel_emb = self.positional_encoding(channel_emb + channel_token_emb)
-
-            # perturb (create random mask)
+                channel_spec = self.stft(channel_data)  # (batch_size, freq, time)
+                channel_emb = self.patch_frequency_embedding(channel_spec)  # (batch_size, time, emb_size)
+            
+            # Add segment position encodings
+            # This is crucial - we need to help the transformer distinguish different segments
+            n_tokens_per_segment = channel_emb.shape[1] // n_segments
+            
+            # Add channel token embedding
+            channel_token = self.channel_tokens(self.index[i + n_channel_offset])
+            channel_token = channel_token.unsqueeze(0).unsqueeze(1)  # (1, 1, emb_size)
+            channel_token = channel_token.expand(batch_size, channel_emb.shape[1], -1)  # (batch_size, time, emb_size)
+            
+            # Add segment encodings
+            segment_ids = torch.arange(n_segments, device=x.device).repeat_interleave(n_tokens_per_segment)
+            segment_ids = segment_ids[:channel_emb.shape[1]]  # Handle potential length mismatch
+            segment_ids = segment_ids.unsqueeze(0).expand(batch_size, -1)  # (batch_size, time)
+            
+            # Create learnable segment embeddings
+            segment_embeddings = nn.Embedding(n_segments, channel_emb.shape[-1]).to(x.device)
+            segment_pos = segment_embeddings(segment_ids)  # (batch_size, time, emb_size)
+            
+            # Combine embeddings: content + channel token + segment position
+            channel_emb = channel_emb + channel_token + segment_pos
+            
+            # Apply standard positional encoding on top
+            channel_emb = self.positional_encoding(channel_emb)
+            
+            # Optional perturbation (while preserving segment structure)
             if perturb:
-                ts = channel_emb.shape[1]
-                ts_new = np.random.randint(ts // 2, ts)
-                selected_ts = np.random.choice(range(ts), ts_new, replace=False)
-                channel_emb = channel_emb[:, selected_ts]
-            emb_seq.append(channel_emb)
+                # Implement perturbation that respects segment boundaries
+                perturbed_embs = []
+                for b in range(batch_size):
+                    batch_emb = channel_emb[b]
+                    segment_lengths = [n_tokens_per_segment] * n_segments
+                    
+                    # Ensure we don't exceed the actual length
+                    if sum(segment_lengths) > batch_emb.shape[0]:
+                        segment_lengths[-1] = batch_emb.shape[0] - sum(segment_lengths[:-1])
+                    
+                    perturbed_batch = []
+                    start_idx = 0
+                    for seg_len in segment_lengths:
+                        if seg_len <= 0:
+                            continue
+                        
+                        seg_data = batch_emb[start_idx:start_idx+seg_len]
+                        # Perturb this segment
+                        ts_new = np.random.randint(max(seg_len // 2, 1), seg_len)
+                        selected_ts = np.random.choice(range(seg_len), ts_new, replace=False)
+                        perturbed_batch.append(seg_data[selected_ts])
+                        start_idx += seg_len
+                    
+                    # Concatenate perturbed segments
+                    perturbed_embs.append(torch.cat(perturbed_batch, dim=0))
+                
+                channel_emb = torch.stack(perturbed_embs)
+            
+            segment_embs.append(channel_emb)
+        
+        # Concatenate all channels' embeddings
+        # Shape: (batch_size, n_channels*time, emb_size)
+        emb = torch.cat(segment_embs, dim=1)
+        
+        # Process through transformer
+        transformed = self.transformer(emb)  # (batch_size, n_channels*time, emb_size)
+        
+        # Now, extract segment-specific representations
+        # We need to aggregate tokens that belong to the same segment
+        segment_embeddings = []
+        
+        # Calculate the number of tokens per segment after transformer processing
+        tokens_per_channel = transformed.shape[1] // n_channels
+        tokens_per_segment = tokens_per_channel // n_segments
+        
+        for s in range(n_segments):
+            segment_tokens = []
+            for c in range(n_channels):
+                # Calculate start and end indices for this segment in this channel
+                start_idx = (c * tokens_per_channel) + (s * tokens_per_segment)
+                end_idx = start_idx + tokens_per_segment
+                
+                # Extract tokens for this segment
+                channel_segment_tokens = transformed[:, start_idx:end_idx, :]  # (batch_size, tokens_per_segment, emb_size)
+                segment_tokens.append(channel_segment_tokens)
+            
+            # Concatenate all channels' tokens for this segment
+            segment_token_concat = torch.cat(segment_tokens, dim=1)  # (batch_size, n_channels*tokens_per_segment, emb_size)
+            
+            # Aggregate to get a single embedding per segment (average pooling)
+            segment_embedding = segment_token_concat.mean(dim=1)  # (batch_size, emb_size)
+            segment_embeddings.append(segment_embedding)
+        
+        # Stack to get final shape: (batch_size, n_segments, emb_size)
+        segment_embeddings = torch.stack(segment_embeddings, dim=1)
+        
+        return segment_embeddings
 
-        # (batch_size, channels*ts, emb)
-        emb = torch.cat(emb_seq, dim=1)
-        # Apply transformer
-        emb = self.transformer(emb)
-        return emb
-
+        
 class BIOTClassifier(nn.Module):
     """Biomedical Input-Output Transformer (BIOT) Classifier."""
     
@@ -466,7 +536,7 @@ class BIOTClassifier(nn.Module):
         self.logger.info(f"Initializing BIOT classifier with emb_size={emb_size}, heads={heads}, "
                          f"depth={depth}, raw={raw}")
         
-        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, log_dir=log_dir, **kwargs)
+        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, raw=raw, log_dir=log_dir, **kwargs)
         self.classifier = ChunkClassificationHead(emb_size=emb_size, chunk_size=chunk_size, mode=classification_mode)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

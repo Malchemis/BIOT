@@ -33,7 +33,7 @@ class MEGDataset(torch.utils.data.Dataset):
         
         Returns:
             Tuple of (data, labels) where:
-            - data has shape (chunk_size, n_channels, n_samples_per_clip)
+            - data has shape (n_channels, chunk_size, n_samples_per_clip)
             - labels has shape (chunk_size)
         """
         file_path = os.path.join(self.root, self.files[idx])
@@ -81,8 +81,8 @@ class MEGDataset(torch.utils.data.Dataset):
             else:
                 labels = label
 
-        # always return (data, labels) tuple as (chunk_size, n_channels, n_samples_per_clip), (chunk_size)
-        return data, labels
+        # always return (data, labels) tuple as (n_channels, n_segments, n_samples_per_clip), (chunk_size)
+        return data.permute(1, 0, 2), labels
 
 
 class TUABLoader(torch.utils.data.Dataset):

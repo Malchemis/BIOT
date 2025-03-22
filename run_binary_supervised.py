@@ -229,10 +229,10 @@ class LitModel_finetune(pl.LightningModule):
 
         # Learning rate scheduler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=5, verbose=True
+            optimizer, mode="max", factor=0.5, patience=5
         )
 
-        return [optimizer], [scheduler]
+        return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "val_pr_auc"}
 
 
 def seed_worker(worker_id):
@@ -359,7 +359,7 @@ def supervised(args):
     lightning_model = LitModel_finetune.load_from_checkpoint(args.pretrain_model_path, args=args, model=model) if args.pretrain_model_path else LitModel_finetune(args, model)
 
     # Logger and callbacks
-    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{args.sample_length}-{args.epochs}-{timestamp}"
+    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{args.epochs}-{timestamp}"
     tensorboard_logger = TensorBoardLogger(
         save_dir=args.model_log_dir,
         version=version,
