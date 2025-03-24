@@ -18,7 +18,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
 from model import BIOTSequenceClassifier
-from utils import MEGDataset, BCE#, relaxed_scores
+from utils import MEGDataset, weighted_BCE
 
 import torch
 import numpy as np
@@ -26,11 +26,12 @@ from sklearn.metrics import precision_score, recall_score, confusion_matrix#, f1
 
 
 class LitModel_finetune(pl.LightningModule):
-    def __init__(self, args: argparse.Namespace, model):
+    def __init__(self, args: argparse.Namespace, model, class_weights=None):
         super().__init__()
         self.model = model
         self.threshold = 0.5
         self.args = args
+        self.class_weights = class_weights
         self.validation_step_outputs = []
         self.test_step_outputs = []
         self.custom_logger = logging.getLogger(__name__)
@@ -49,14 +50,15 @@ class LitModel_finetune(pl.LightningModule):
         prob = self.model(X)
 
         # Option 1: Original BCE loss (no weighting)
-        loss = BCE(prob, y)
+        # loss = BCE(prob, y)
         # Option 2: Weighted BCE with class-specific weights
-        # loss = weighted_BCE(prob, y, self.class_weights)
+        loss = weighted_BCE(prob, y, self.class_weights)
         # Option 3: Original focal loss
-        # loss = focal_loss(prob, y, alpha=0.8, gamma=0.7)
+        # loss = focal_loss(prob, y, gamma=2.0, alpha=0.25)
         # Option 4: Focal loss with class weights
         # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
         self.log("train_loss", loss)
+        self.custom_logger.info(f"Training loss: {loss}")
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -285,10 +287,14 @@ def prepare_meg_dataloader(args):
     test_files = os.listdir(os.path.join(root, "test"))
 
     logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
-
+    train_set = MEGDataset.from_processed_dir(root, "train", use_weights=True, cache_size=100, metadata_only=False)
+    val_set = MEGDataset.from_processed_dir(root, "val", use_weights=True, cache_size=100, metadata_only=False)
+    test_set = MEGDataset.from_processed_dir(root, "test", use_weights=True, cache_size=100, metadata_only=False)
+    logger.info(f"Size of train, val, and test sets: {len(train_set)}, {len(val_set)}, {len(test_set)}")
+    logger.info(f"Size of a sample from train, val, and test sets: {train_set[0][0].size()}, {val_set[0][0].size()}, {test_set[0][0].size()}")
     # Prepare training and test data loader
     train_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "train"), train_files),
+        train_set,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
@@ -297,7 +303,7 @@ def prepare_meg_dataloader(args):
         worker_init_fn=seed_worker
     )
     test_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "test"), test_files),
+        test_set,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -305,7 +311,7 @@ def prepare_meg_dataloader(args):
         worker_init_fn=seed_worker
     )
     val_loader = torch.utils.data.DataLoader(
-        MEGDataset(os.path.join(root, "val"), val_files),
+        val_set,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -323,7 +329,7 @@ def prepare_meg_dataloader(args):
     for _, (X, y) in enumerate(test_loader):
         logger.info(f"Test loader: {X.shape}, {y.shape}")
         break
-    return train_loader, test_loader, val_loader, X.shape, y.shape
+    return train_loader, test_loader, val_loader, X.shape, y.shape, train_set.class_weights
 
 
 def supervised(args):
@@ -345,7 +351,7 @@ def supervised(args):
     # Get data loaders
     logger.info(f"Preparing data loaders for dataset: {args.dataset}")
     if args.dataset == "MEG":
-        train_loader, test_loader, val_loader, input_shape, output_shape = prepare_meg_dataloader(args)
+        train_loader, test_loader, val_loader, input_shape, output_shape, class_weights = prepare_meg_dataloader(args)
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented")
 
@@ -366,7 +372,7 @@ def supervised(args):
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
         
-    lightning_model = LitModel_finetune.load_from_checkpoint(args.pretrain_model_path, args=args, model=model) if args.pretrain_model_path else LitModel_finetune(args, model)
+    lightning_model = LitModel_finetune.load_from_checkpoint(args.pretrain_model_path, args=args, model=model, class_weights=class_weights) if args.pretrain_model_path else LitModel_finetune(args, model, class_weights=class_weights)
 
     # Logger and callbacks
     version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{args.epochs}-{timestamp}"

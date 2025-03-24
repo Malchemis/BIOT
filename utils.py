@@ -5,87 +5,301 @@ import torch
 import numpy as np
 import os
 from scipy.signal import resample
+from collections import defaultdict, OrderedDict
+from tqdm import tqdm
 from typing import List, Tuple, Optional, Dict, Union
 
-
 class MEGDataset(torch.utils.data.Dataset):
-    """Dataset for loading MEG data with uniform chunk-based processing.
-    
-    This dataset consistently loads data with a chunk dimension, whether
-    dealing with individual segments or multiple segments per chunk.
+    """PyTorch Dataset for loading preprocessed MEG data.
+
+    This dataset loads preprocessed MEG data from disk, stored as PyTorch tensors.
+    Each data sample contains the MEG signal and its associated label.
+
+    Attributes:
+        root: Root directory containing the processed data.
+        files: List of filenames to use.
+        class_weights: Optional weights for each class to handle imbalance.
+        cache_size: Number of samples to cache in memory (0 for no caching).
+        metadata_only: If True, only load metadata without loading full tensors.
     """
-    
-    def __init__(self, root: str, files: List[str]):
-        """Initialize the dataset.
-        
+
+    def __init__(self,
+                 root: str,
+                 files: List[str],
+                 class_weights: Optional[Dict[int, float]] = None,
+                 cache_size: int = 0,
+                 metadata_only: bool = False):
+        """Initialize the MEG dataset.
+
         Args:
             root: Root directory containing the processed data.
             files: List of filenames to use.
+            class_weights: Optional dictionary mapping class indices to weights.
+            cache_size: Number of samples to cache in memory (0 for no caching).
+            metadata_only: If True, only load metadata without loading full tensors.
         """
         self.root = root
         self.files = files
-        
-    def __len__(self):
-        return len(self.files)
-    
-    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a sample from the dataset.
-        
+        self.class_weights = class_weights
+        self.cache_size = cache_size
+        self.metadata_only = metadata_only
+        self.custom_logger = logging.getLogger(__name__)
+
+        # Initialize cache
+        self.cache = OrderedDict()
+
+        # Preload metadata if requested
+        self.metadata = {}
+        if self.metadata_only:
+            self.preload_metadata()
+
+    def preload_metadata(self) -> None:
+        """Preload metadata for all files to enable efficient querying."""
+        self.custom_logger.info(f"Preloading metadata for {len(self.files)} files...")
+        for idx, filename in enumerate(tqdm(self.files, desc="Loading metadata")):
+            file_path = Path(self.root, filename)
+            try:
+                # Use torch.load with map_location='cpu' for better compatibility
+                sample = torch.load(file_path, map_location='cpu')
+                # Extract only metadata (exclude large tensors)
+                meta = {k: v for k, v in sample.items() if k != 'data'}
+                self.metadata[idx] = meta
+            except Exception as e:
+                self.custom_logger.warning(f"Error loading metadata for {file_path}: {str(e)}")
+                self.metadata[idx] = None
+
+        self.custom_logger.info(f"Metadata preloaded for {len(self.metadata)} files")
+
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset.
+
         Returns:
-            Tuple of (data, labels) where:
-            - data has shape (n_channels, chunk_size * n_samples_per_clip)
-            - labels has shape (chunk_size)
+            Number of samples in the dataset.
         """
-        file_path = os.path.join(self.root, self.files[idx])
-        sample = torch.load(file_path, map_location='cpu')
-        
-        # Determine if this is a multi-segment chunk or single segment
-        is_chunk = sample.get('is_chunk', False)
-        
-        if is_chunk:
-            # Multi-segment chunk
-            data = sample['data']  # Shape: (chunk_size, n_channels, n_samples_per_clip)
-            labels = sample['label']  # Shape: (chunk_size)
-            
-            # Ensure data has the correct dimensions
-            if len(data.shape) == 3:
-                # Already in correct format: (chunk_size, n_channels, n_samples_per_clip)
-                pass
-            elif len(data.shape) == 2:
-                # Single-channel case, add channel dimension
-                data = data.unsqueeze(1)
-            else:
-                raise ValueError(f"Unexpected data shape: {data.shape}")
-                
-            # Ensure labels has the right shape
-            if not isinstance(labels, torch.Tensor):
-                labels = torch.tensor(labels)
-            if len(labels.shape) == 0:
-                # Single scalar label, make it a 1D tensor
-                labels = labels.unsqueeze(0)
+        return len(self.files)
+
+    def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Get a sample from the dataset."""
+        # Check cache first
+        if idx in self.cache:
+            sample = self.cache[idx]
         else:
-            # Single segment, add chunk dimension
-            data = sample['data']  # Shape: (n_channels, n_samples)
-            label = sample['label']  # Scalar or 1D tensor with single value
-            
-            # Add chunk dimension (of size 1)
-            data = data.unsqueeze(0)  # Shape: (chunk_size=1, n_channels, n_samples)
-            
-            # Convert label to tensor if needed
-            if not isinstance(label, torch.Tensor):
-                label = torch.tensor(label)
-            
-            # Ensure label has the right shape
-            if len(label.shape) == 0:
-                labels = label.unsqueeze(0)  # Shape: (1)
-            else:
-                labels = label
+            # Load MEG data
+            file_path = Path(self.root, self.files[idx])
+            try:
+                sample = torch.load(file_path, map_location='cpu')
+
+                # Check if required keys exist
+                if 'data' not in sample or 'label' not in sample:
+                    self.custom_logger.warning(f"File {file_path} missing required keys. Found: {sample.keys()}")
+                    raise ValueError("Missing required keys in sample")
+
+                # Update cache if enabled
+                if self.cache_size > 0:
+                    self._update_cache(idx, sample)
+
+            except Exception as e:
+                self.custom_logger.error(f"Error loading file {file_path}: {str(e)}")
+                raise RuntimeError(f"Error loading file {file_path}: {str(e)}")
+
+        data, label = sample['data'], sample['label']
+
+        # convert to tensor if not already
+        if not torch.is_tensor(data):
+            data = torch.tensor(data, dtype=torch.float32)
+        if not torch.is_tensor(label):
+            label = torch.tensor(label, dtype=torch.long)
 
         # always return (data, labels) tuple as (n_channels, n_segments * n_samples_per_clip), (chunk_size)
         data = data.permute(1, 0, 2)
-        # unconcatenate the data so that it is (n_channels, chunk_size * n_samples_per_clip) but with temporal information preserved
         data = data.reshape(data.shape[0], -1)
-        return data, labels
+        return data, label
+
+    def _update_cache(self, idx: int, sample: Dict[str, torch.Tensor]) -> None:
+        """Update the sample cache using LRU strategy.
+
+        Args:
+            idx: Index of the sample.
+            sample: Sample data.
+        """
+        # Add to cache
+        self.cache[idx] = sample
+
+        # Remove the oldest if exceeding cache size
+        while len(self.cache) > self.cache_size:
+            self.cache.popitem(last=False)  # Remove oldest item
+
+    def get_patient_ids(self) -> List[str]:
+        """Get a list of unique patient IDs in the dataset.
+
+        Returns:
+            List of unique patient IDs.
+        """
+        if self.metadata_only and self.metadata:
+            patient_ids = set()
+            for meta in self.metadata.values():
+                if meta and 'patient_id' in meta:
+                    patient_ids.add(meta['patient_id'])
+            return sorted(list(patient_ids))
+
+        # Fall back to loading from files
+        patient_ids = set()
+        for idx in range(len(self)):
+            file_path = Path(self.root, self.files[idx])
+            try:
+                sample = torch.load(file_path, map_location='cpu')
+                if 'patient_id' in sample:
+                    patient_ids.add(sample['patient_id'])
+            except (FileNotFoundError, RuntimeError) as e:
+                self.custom_logger.warning(f"Error loading {file_path}: {e}")
+
+        return sorted(list(patient_ids))
+
+    def get_class_distribution(self) -> Dict[int, int]:
+        """Get distribution of classes in the dataset.
+
+        Returns:
+            Dictionary mapping class labels to counts.
+        """
+        if self.metadata_only and self.metadata:
+            distribution = defaultdict(int)
+            for meta in self.metadata.values():
+                if meta and 'label' in meta:
+                    label = meta['label'].item()
+                    distribution[label] += 1
+            return dict(distribution)
+
+        # Process in batches for better efficiency
+        distribution = defaultdict(int)
+        batch_size = 100
+        
+        for batch_start in range(0, len(self), batch_size):
+            batch_end = min(batch_start + batch_size, len(self))
+            
+            for idx in range(batch_start, batch_end):
+                file_path = Path(self.root, self.files[idx])
+                try:
+                    # Just load the label instead of the full sample
+                    sample = torch.load(file_path, map_location='cpu')
+                    label = sample['label'].item()
+                    distribution[label] += 1
+                except Exception as e:
+                    self.custom_logger.warning(f"Error loading {file_path}: {e}")
+                    
+        return dict(distribution)
+
+    def get_samples_by_patient(self, patient_id: str) -> List[int]:
+        """Get indices of samples belonging to a specific patient.
+
+        Args:
+            patient_id: ID of the patient.
+
+        Returns:
+            List of sample indices.
+        """
+        if self.metadata_only and self.metadata:
+            return [idx for idx, meta in self.metadata.items()
+                    if meta and 'patient_id' in meta and meta['patient_id'] == patient_id]
+
+        # Fall back to loading from files
+        indices = []
+        for idx in range(len(self)):
+            file_path = Path(self.root, self.files[idx])
+            try:
+                sample = torch.load(file_path, map_location='cpu')
+                if sample.get('patient_id') == patient_id:
+                    indices.append(idx)
+            except (FileNotFoundError, RuntimeError) as e:
+                self.custom_logger.warning(f"Error loading {file_path}: {e}")
+        return indices
+
+    @classmethod
+    def calculate_class_weights(cls, files_list: List[str], root_dir: str) -> Dict[int, float]:
+        """Calculate class weights based on class distribution.
+
+        Args:
+            files_list: List of data file paths
+            root_dir: Root directory containing the files
+
+        Returns:
+            Dictionary mapping class indices to weights
+        """
+        # Count occurrences of each class
+        class_counts = defaultdict(int)
+        custom_logger = logging.getLogger(__name__)
+
+        for file_path in tqdm(files_list, desc="Calculating class weights"):
+            full_path = os.path.join(root_dir, file_path)
+            try:
+                sample = torch.load(full_path, map_location='cpu')
+                label = sample['label'].item()
+                class_counts[label] += 1
+            except Exception as e:
+                custom_logger.warning(f"Error loading {file_path} for class weight calculation: {e}")
+
+        # Calculate weights as inverse of frequency
+        total_samples = sum(class_counts.values())
+        class_weights = {}
+
+        for label, count in class_counts.items():
+            # Inverse frequency weighting
+            class_weights[label] = total_samples / (len(class_counts) * count)
+
+        custom_logger.info(f"Calculated class weights: {class_weights}")
+        return class_weights
+
+    @classmethod
+    def from_processed_dir(cls, processed_dir: str, split: str = 'train',
+                           use_weights: bool = True, cache_size: int = 0,
+                           metadata_only: bool = False) -> 'MEGDataset':
+        """Create a dataset from a processed directory.
+
+        Args:
+            processed_dir: Path to the processed data directory.
+            split: Data split to use ('train', 'val', or 'test').
+            use_weights: Whether to use class weights.
+            cache_size: Number of samples to cache in memory.
+            metadata_only: Whether to only load metadata.
+
+        Returns:
+            Configured MEGDataset instance.
+
+        Raises:
+            FileNotFoundError: If the file list for the specified split is not found.
+        """
+        custom_logger = logging.getLogger(__name__)
+
+        # Load file list
+        file_list_path = os.path.join(processed_dir, f"{split}_files.pkl")
+        if not os.path.exists(file_list_path):
+            raise FileNotFoundError(f"File list not found at {file_list_path}")
+
+        with open(file_list_path, 'rb') as f:
+            files_list = pickle.load(f)
+
+        custom_logger.info(f"Loaded {len(files_list)} files for {split} split")
+
+        # Load class weights if requested
+        class_weights = None
+        if use_weights:
+            weights_path = os.path.join(processed_dir, "class_weights.pkl")
+            if os.path.exists(weights_path):
+                with open(weights_path, 'rb') as f:
+                    all_weights = pickle.load(f)
+                class_weights = all_weights.get(split)
+                custom_logger.info(f"Loaded class weights for {split}: {class_weights}")
+            else:
+                custom_logger.warning(f"Class weights file not found at {weights_path}")
+
+        # Create dataset
+        return cls(
+            root=os.path.join(processed_dir, split),
+            files=files_list,
+            class_weights=class_weights,
+            cache_size=cache_size,
+            metadata_only=metadata_only
+        )
 
 
 class TUABLoader(torch.utils.data.Dataset):
@@ -952,26 +1166,24 @@ def focal_loss_with_class_weights(y_hat: torch.Tensor, y: torch.Tensor,
 
 
 def weighted_BCE(y_hat: torch.Tensor, y: torch.Tensor, class_weights: Dict[int, float]) -> torch.Tensor:
-    """Calculate weighted binary cross-entropy loss."""
-    y_hat = y_hat.view(-1, 1)
-    y = y.view(-1, 1)
+    """Calculate weighted binary cross-entropy loss with logits."""
+    # Reshape from 
+    # - y_hat: (batch_size, n_segments, 1), y: (batch_size, n_segments) to 
+    # - y_hat: (batch_size * n_segments), y: (batch_size * n_segments)
+    y_hat = y_hat.view(-1)
+    y = y.view(-1).float()  # Ensure targets are float for BCE
     
-    # Apply different weights based on class
+    # Create weight tensor for sample weighting
     weights = torch.ones_like(y, dtype=torch.float32)
-    weights[y == 0] = class_weights[0]  # Weight for non-spike samples
-    weights[y == 1] = class_weights[1]  # Weight for spike samples
+    weights[y == 0] = class_weights[0]
+    weights[y == 1] = class_weights[1]
     
-    # Classical BCE calculation
-    bce_loss = (
-        -y * y_hat
-        + torch.log(1 + torch.exp(-torch.abs(y_hat)))
-        + torch.max(y_hat, torch.zeros_like(y_hat))
+    # Use PyTorch's built-in function that handles logits properly
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        y_hat, y, weight=weights, reduction='none'
     )
     
-    # Apply weights
-    weighted_loss = weights * bce_loss
-    
-    return weighted_loss.mean()
+    return loss.mean()
 
 
 def BCE(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -178,7 +178,7 @@ class SequentialClassificationHead(nn.Module):
             emb_size: Size of the input embeddings.
             n_classes: Number of output classes.
             n_segments: Number of segments to predict.
-            method: Method for processing ('lstm', 'attention', or 'gating').
+            method: Method for processing ('lstm', 'attention', 'gating').
             hidden_size: Size of LSTM hidden layers.
             num_layers: Number of LSTM layers.
             bidirectional: Whether to use bidirectional LSTM.
@@ -235,10 +235,9 @@ class SequentialClassificationHead(nn.Module):
             nn.Linear(output_size, n_classes)
         )
         
-        # Additional projection if we need to align the sequence length
-        self.needs_alignment = True
-        if self.needs_alignment:
-            self.align_layer = nn.Linear(1, 1)  # Placeholder, will be properly initialized in forward
+        # Replace linear projection with adaptive pooling for better handling of extreme dimensionality reduction
+        self.align_layer = nn.AdaptiveAvgPool1d(self.n_segments)
+        self.logger.info(f"Using adaptive average pooling for sequence alignment to {n_segments} segments")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Process sequence and classify each segment.
@@ -250,6 +249,8 @@ class SequentialClassificationHead(nn.Module):
             Logits for each segment (batch_size, n_segments, n_classes).
         """
         batch_size, seq_len, emb_size = x.shape
+        self.logger.debug(f"Data shape after embedding: {x.shape}") # with current parameters: [32, 27225, 256] for batch_size, seq_len, emb_size, 
+                                                                    # we need to reduce the seq_len to n_segments
         
         # Process the sequence with the chosen method
         if self.method == 'lstm':
@@ -265,24 +266,17 @@ class SequentialClassificationHead(nn.Module):
             gates = self.processor(x)
             processed = x * gates
         
-        # Align sequence length with the number of segments if needed
-        if seq_len != self.n_segments:
-            # Initialize alignment layer if this is the first forward pass
-            if hasattr(self, 'align_layer') and isinstance(self.align_layer, nn.Linear) and self.align_layer.weight.shape[0] == 1:
-                self.align_layer = nn.Linear(seq_len, self.n_segments)
-                if x.is_cuda:
-                    self.align_layer = self.align_layer.cuda()
-                self.logger.info(f"Initialized alignment layer: {seq_len} → {self.n_segments}")
-            
-            # Transpose, align, and transpose back
-            # (batch_size, seq_len, emb_size) → (batch_size, emb_size, seq_len)
-            transposed = processed.transpose(1, 2)
-            # (batch_size, emb_size, seq_len) → (batch_size, emb_size, n_segments)
-            aligned = self.align_layer(transposed)
-            # (batch_size, emb_size, n_segments) → (batch_size, n_segments, emb_size)
-            processed = aligned.transpose(1, 2)
-            
-            self.logger.debug(f"Aligned sequence: {seq_len} → {self.n_segments}")
+        # Align sequence length with the number of segments using adaptive pooling
+        # Transpose to (batch_size, emb_size, seq_len) for pooling operation
+        transposed = processed.transpose(1, 2)
+        
+        # Apply adaptive pooling to get desired number of segments
+        aligned = self.align_layer(transposed)  # (batch_size, n_segments)
+        
+        # Transpose back to (batch_size, n_segments, emb_size)
+        processed = aligned.transpose(1, 2)
+        
+        self.logger.debug(f"Aligned sequence from {seq_len} → {self.n_segments} using adaptive pooling")
         
         # Process through the classifier to get logits for each segment
         logits = self.classifier(processed)  # (batch_size, n_segments, n_classes)
