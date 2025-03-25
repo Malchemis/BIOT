@@ -1187,33 +1187,16 @@ def weighted_BCE(y_hat: torch.Tensor, y: torch.Tensor, class_weights: Dict[int, 
 
 
 def BCE(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Calculate binary cross-entropy loss for multi-segment output.
+    """Binary cross-entropy loss with logits."""
+    # Reshape from 
+    # - y_hat: (batch_size, n_segments, 1), y: (batch_size, n_segments) to 
+    # - y_hat: (batch_size * n_segments), y: (batch_size * n_segments)
+    y_hat = y_hat.view(-1)
+    y = y.view(-1).float()  # Ensure targets are float for BCE
     
-    This implementation is numerically stable and handles multi-segment predictions.
-    
-    Args:
-        y_hat: Predicted logits (batch_size, n_segments, n_classes) or (batch_size, n_classes)
-        y: True labels (batch_size, n_segments) or (batch_size)
-        
-    Returns:
-        Calculated BCE loss
-    """
-    # Handle multi-segment output (batch_size, n_segments, n_classes)
-    if len(y_hat.shape) == 3:
-        # Reshape to (batch_size * n_segments, n_classes)
-        y_hat = y_hat.reshape(-1, y_hat.shape[-1])
-        # Reshape labels to (batch_size * n_segments)
-        y = y.reshape(-1)
-    
-    # Now handle as standard classification (batch_size, n_classes)
-    y_hat = y_hat.view(-1, 1)  # (batch_size, 1) or (batch_size * n_segments, 1)
-    y = y.view(-1, 1)  # (batch_size, 1) or (batch_size * n_segments, 1)
-    
-    # BCE with logits loss
-    loss = (
-        -y * y_hat
-        + torch.log(1 + torch.exp(-torch.abs(y_hat)))
-        + torch.max(y_hat, torch.zeros_like(y_hat))
+    # Use PyTorch's built-in function that handles logits properly
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        y_hat, y, reduction='none'
     )
     
     return loss.mean()

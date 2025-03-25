@@ -18,7 +18,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
 from model import BIOTSequenceClassifier
-from utils import MEGDataset, weighted_BCE
+from utils import MEGDataset, weighted_BCE, BCE
 
 import torch
 import numpy as np
@@ -48,6 +48,12 @@ class LitModel_finetune(pl.LightningModule):
         """
         X, y = batch
         prob = self.model(X)
+
+        # # For debugging: print actual probabilities (0-1 range)
+        # if batch_idx == 0:  # Only print for first batch to avoid spam
+        #     probs_sigmoid = torch.sigmoid(prob)
+        #     self.custom_logger.info(f"Probabilities after sigmoid: {probs_sigmoid[0][:100]}")
+        #     self.custom_logger.info(f"Ground truth: {y[0][:100]}")
 
         # Option 1: Original BCE loss (no weighting)
         # loss = BCE(prob, y)
@@ -238,11 +244,11 @@ class LitModel_finetune(pl.LightningModule):
         )
 
         # Learning rate scheduler
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer, mode="max", factor=0.5, patience=5
-        # )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=3
+        )
 
-        return {"optimizer": optimizer}#, "lr_scheduler": scheduler, "monitor": "val_pr_auc"}
+        return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "val_pr_auc"}
 
 
 def seed_worker(worker_id):
