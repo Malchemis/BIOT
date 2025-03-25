@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.MultiheadAttention
 import numpy as np
 from linear_attention_transformer import LinearAttentionTransformer
 
@@ -154,134 +155,6 @@ class ClassificationHead(nn.Sequential):
             Class logits.
         """
         return self.clshead(x)
-    
-class SequentialClassificationHead(nn.Module):
-    """Classification head for multi-segment prediction.
-    
-    This module processes the sequence of embeddings from the transformer 
-    and produces a prediction for each segment using context from the whole chunk.
-    
-    Attributes:
-        method (str): Method for sequence processing ('lstm', 'attention', or 'gating').
-        processor: Sequential processing module (LSTM, Self-Attention, or Context Gating).
-        classifier: Final classification layer.
-    """
-    
-    def __init__(self, emb_size: int, n_classes: int, n_segments: int, 
-                 method: str = 'lstm', hidden_size: int = 128, 
-                 num_layers: int = 1, bidirectional: bool = True,
-                 num_heads: int = 8, dropout: float = 0.1,
-                 log_dir: Optional[str] = None):
-        """Initialize the sequential classification head.
-        
-        Args:
-            emb_size: Size of the input embeddings.
-            n_classes: Number of output classes.
-            n_segments: Number of segments to predict.
-            method: Method for processing ('lstm', 'attention', 'gating').
-            hidden_size: Size of LSTM hidden layers.
-            num_layers: Number of LSTM layers.
-            bidirectional: Whether to use bidirectional LSTM.
-            num_heads: Number of attention heads.
-            dropout: Dropout rate.
-            log_dir: Optional directory for log files.
-        """
-        super().__init__()
-        self.n_segments = n_segments
-        self.method = method
-        self.logger = logging.getLogger(__name__ + ".SequentialClassificationHead")
-        
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "sequential_head.log"))
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(file_handler)
-            
-        self.logger.info(f"Initializing with method={method}, n_segments={n_segments}")
-        
-        # Choose the sequence processing method
-        if method == 'lstm':
-            self.processor = nn.LSTM(
-                input_size=emb_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-                bidirectional=bidirectional,
-                dropout=dropout if num_layers > 1 else 0
-            )
-            output_size = hidden_size * (2 if bidirectional else 1)
-        elif method == 'attention':
-            self.processor = nn.MultiheadAttention(
-                embed_dim=emb_size,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True
-            )
-            # Add a normalization layer for attention
-            self.norm = nn.LayerNorm(emb_size)
-            output_size = emb_size
-        elif method == 'gating':
-            self.processor = nn.Sequential(
-                nn.Linear(emb_size, emb_size),
-                nn.Sigmoid()
-            )
-            output_size = emb_size
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        
-        # Final classification layer
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(output_size, n_classes)
-        )
-        
-        # Replace linear projection with adaptive pooling for better handling of extreme dimensionality reduction
-        self.align_layer = nn.AdaptiveAvgPool1d(self.n_segments)
-        self.logger.info(f"Using adaptive average pooling for sequence alignment to {n_segments} segments")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Process sequence and classify each segment.
-        
-        Args:
-            x: Input tensor from transformer (batch_size, seq_len, emb_size).
-            
-        Returns:
-            Logits for each segment (batch_size, n_segments, n_classes).
-        """
-        batch_size, seq_len, emb_size = x.shape
-        self.logger.debug(f"Data shape after embedding: {x.shape}") # with current parameters: [32, 27225, 256] for batch_size, seq_len, emb_size, 
-                                                                    # we need to reduce the seq_len to n_segments
-        
-        # Process the sequence with the chosen method
-        if self.method == 'lstm':
-            # Process through LSTM
-            lstm_out, _ = self.processor(x)
-            processed = lstm_out
-        elif self.method == 'attention':
-            # Self-attention processing
-            attn_out, _ = self.processor(x, x, x)
-            processed = self.norm(x + attn_out)  # Residual connection
-        elif self.method == 'gating':
-            # Context gating
-            gates = self.processor(x)
-            processed = x * gates
-        
-        # Align sequence length with the number of segments using adaptive pooling
-        # Transpose to (batch_size, emb_size, seq_len) for pooling operation
-        transposed = processed.transpose(1, 2)
-        
-        # Apply adaptive pooling to get desired number of segments
-        aligned = self.align_layer(transposed)  # (batch_size, n_segments)
-        
-        # Transpose back to (batch_size, n_segments, emb_size)
-        processed = aligned.transpose(1, 2)
-        
-        self.logger.debug(f"Aligned sequence from {seq_len} → {self.n_segments} using adaptive pooling")
-        
-        # Process through the classifier to get logits for each segment
-        logits = self.classifier(processed)  # (batch_size, n_segments, n_classes)
-        
-        return logits
 
 
 class PositionalEncoding(nn.Module):
@@ -295,7 +168,7 @@ class PositionalEncoding(nn.Module):
         pe (torch.Tensor): Precomputed positional encoding. (registered as to not be a model parameter)
     """
     
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000, log_dir: Optional[str] = None):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 800, log_dir: Optional[str] = None):
         """Initialize the positional encoding.
         
         Args:
@@ -505,7 +378,7 @@ class BIOTEncoder(nn.Module):
         # (batch_size, channels*ts, emb)
         emb = torch.cat(emb_seq, dim=1)
         # (batch_size, emb)
-        emb = self.transformer(emb)#.mean(dim=1) # don't collapse the time dimension 
+        emb = self.transformer(emb).mean(dim=1) # collapse the time dimension 
         return emb
 
         
@@ -563,219 +436,283 @@ class BIOTClassifier(nn.Module):
         return x
 
 
-class BIOTSequenceClassifier(nn.Module):
-    """Biomedical Input-Output Transformer (BIOT) for multi-segment classification.
+class MultiSegmentBIOTEncoder(nn.Module):
+    """Enhanced BIOT Encoder for processing multiple segments simultaneously.
     
-    This model processes an entire chunk of data and outputs predictions 
-    for each segment while considering the context of the whole chunk.
+    This encoder processes chunks of MEG data by treating them as one long sequence
+    with segment tokens to mark boundaries between segments. It preserves the
+    channel token mechanism while adding contextual information across segments.
     
     Attributes:
-        biot (BIOTEncoder): BIOT encoder for feature extraction.
-        classifier (SequentialClassificationHead): Classification head.
+        base_encoder (BIOTEncoder): The underlying BIOT encoder
+        segment_tokens (nn.Embedding): Embedding for segment tokens
+        segment_indices (nn.Parameter): Parameter for segment indices
     """
     
-    def __init__(self, emb_size: int = 256, heads: int = 8, depth: int = 4, 
-                 n_classes: int = 1, n_channels: int = 16, n_segments: int = 1, 
-                 seq_method: str = 'lstm', n_fft: int = 200, hop_length: int = 100,
-                 raw: bool = False, patch_size: int = 100, overlap: float = 0.0, 
-                 log_dir: Optional[str] = None, **kwargs):
-        """Initialize the BIOT sequence classifier.
+    def __init__(
+            self,
+            emb_size: int = 256,
+            heads: int = 8,
+            depth: int = 4,
+            n_channels: int = 275,
+            n_projected_channels: int = 64,
+            max_segments: int = 16,  # Maximum number of segments in a chunk
+            n_fft: int = 200,
+            hop_length: int = 100,
+            raw: bool = False,
+            patch_size: int = 100,
+            overlap: float = 0.0,
+            log_dir: Optional[str] = None,
+            **kwargs
+    ):
+        """Initialize the multi-segment BIOT encoder.
         
         Args:
-            emb_size: Size of the embedding vectors.
-            heads: Number of attention heads.
-            depth: Number of transformer layers.
-            n_classes: Number of output classes.
-            n_channels: Number of input channels.
-            n_segments: Number of segments to predict.
-            seq_method: Method for sequence processing ('lstm', 'attention', 'gating').
-            n_fft: Number of FFT points.
-            hop_length: Hop length for STFT.
-            raw: Whether to use raw time-domain processing.
-            patch_size: Patch size for raw data.
-            overlap: Overlap between patches.
-            log_dir: Optional directory for log files.
-            **kwargs: Additional keyword arguments.
+            emb_size: Size of the embedding vectors
+            heads: Number of attention heads
+            depth: Number of transformer layers
+            n_channels: Number of input channels
+            max_segments: Maximum number of segments per chunk
+            n_fft: Number of FFT points
+            hop_length: Hop length for STFT
+            raw: Whether to use raw time-domain processing
+            patch_size: Patch size for raw data mode
+            overlap: Overlap between patches for raw data mode
+            log_dir: Optional directory for log files
+            **kwargs: Additional keyword arguments
         """
         super().__init__()
-        self.logger = logging.getLogger(__name__ + ".BIOTSequenceClassifier")
+        self.logger = logging.getLogger(__name__ + ".MultiSegmentBIOTEncoder")
         
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "biot_sequence.log"))
+            file_handler = logging.FileHandler(os.path.join(log_dir, "multi_segment_biot_encoder.log"))
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(file_handler)
-            
-        self.logger.info(f"Initializing with n_segments={n_segments}, method={seq_method}")
+
+        # Reduction spatial dimension to n_projected_channels
+        self.channel_reduction = nn.Conv1d(
+            in_channels=n_channels,
+            out_channels=n_projected_channels,
+            kernel_size=1,
+            stride=1,
+        ) # linear combination across channels
         
-        # Initialize the BIOT encoder (no modifications needed here)
-        self.biot = BIOTEncoder(
-            emb_size=emb_size, 
-            heads=heads, 
-            depth=depth, 
-            n_channels=n_channels,
-            n_fft=n_fft, 
+        # Create the base BIOT encoder
+        self.base_encoder = BIOTEncoder(
+            emb_size=emb_size,
+            heads=heads,
+            depth=depth,
+            n_channels=n_projected_channels, # Reduced channels
+            n_fft=n_fft,
             hop_length=hop_length,
-            raw=raw, 
-            patch_size=patch_size, 
-            overlap=overlap, 
+            raw=raw,
+            patch_size=patch_size,
+            overlap=overlap,
             log_dir=log_dir,
             **kwargs
         )
         
-        # Initialize the sequential classification head
-        self.classifier = SequentialClassificationHead(
-            emb_size=emb_size,
-            n_classes=n_classes,
-            n_segments=n_segments,
-            method=seq_method,
-            log_dir=log_dir
+        # Add segment tokens embeddings
+        self.segment_tokens = nn.Embedding(max_segments, emb_size)
+        self.segment_indices = nn.Parameter(
+            torch.arange(max_segments), requires_grad=False
         )
 
+        self.segment_attention = MultiHeadAttention(emb_size, heads)
+        self.segment_layer_norm = nn.LayerNorm(emb_size)
+
+        
+        # Save parameters
+        self.n_channels = n_channels
+        self.max_segments = max_segments
+        self.emb_size = emb_size
+        self.segment_length = None  # Will be determined during first forward pass
+        
+        self.logger.info(f"Initialized with max_segments={max_segments}, n_channels={n_channels}")
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the model.
+        """Forward pass of the multi-segment BIOT encoder.
         
         Args:
-            x: Input tensor of shape (batch_size, channel, ts).
+            x: Input tensor of shape (batch_size, n_channels, total_time)
+                where total_time = n_segments * segment_length
             
         Returns:
-            Logits for each segment (batch_size, n_segments, n_classes).
+            Segment embeddings of shape (batch_size, n_segments, emb_size)
         """
-        # Process through BIOT encoder (which now preserves temporal info)
-        embeddings = self.biot(x)  # (batch_size, seq_len, emb_size)
+        # Modified segment processing
+        batch_size, n_channels, total_time = x.shape
         
-        # Process through sequential classification head
-        logits = self.classifier(embeddings)  # (batch_size, n_segments, n_classes)
-        return logits
-
-
-class UnsupervisedPretrain(nn.Module):
-    """Unsupervised pretraining model for BIOT.
-    
-    This model uses contrastive learning to pretrain the BIOT encoder.
-    
-    Attributes:
-        biot (BIOTEncoder): BIOT encoder for feature extraction.
-        prediction (nn.Sequential): MLP for feature prediction.
-    """
-    
-    def __init__(self, emb_size: int = 256, heads: int = 8, depth: int = 4, 
-                 n_channels: int = 18, raw: bool = False, log_dir: Optional[str] = None, **kwargs):
-        """Initialize the unsupervised pretraining model.
+        # Calculate exact segment length
+        self.segment_length = total_time // self.max_segments
+        actual_segments = min(total_time // self.segment_length, self.max_segments)
         
-        Args:
-            emb_size: Size of the embedding vectors.
-            heads: Number of attention heads.
-            depth: Number of transformer layers.
-            n_channels: Number of input channels.
-            raw: Whether to use raw time-domain processing.
-            log_dir: Optional directory for log files. If None, logs to console only.
-            **kwargs: Additional parameters passed to BIOTEncoder.
-        """
-        super(UnsupervisedPretrain, self).__init__()
-        self.logger = logging.getLogger(__name__ + ".UnsupervisedPretrain")
+        # Process all channels simultaneously
+        projected = self.channel_projection(x)  # [B, C_proj, T]
         
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "unsupervised_pretrain.log"))
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(file_handler)
-            
-        self.logger.info(f"Initializing unsupervised pretraining model with emb_size={emb_size}, "
-                         f"heads={heads}, depth={depth}, n_channels={n_channels}, raw={raw}")
-        
-        self.biot = BIOTEncoder(emb_size, heads, depth, n_channels, raw=raw, 
-                               log_dir=log_dir, **kwargs)
-        self.prediction = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.GELU(),
-            nn.Linear(256, 256),
+        # Reshape to segments [B, C_proj, S, L]
+        segments = projected.view(
+            batch_size, 
+            self.projected_channels,
+            actual_segments,
+            self.segment_length
         )
-
-    def forward(self, x: torch.Tensor, n_channel_offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass of the unsupervised pretraining model.
         
-        Args:
-            x: Input tensor of shape (batch_size, channel, ts).
-            n_channel_offset: Offset for channel tokens.
+        # Process each segment independently
+        segment_embeddings = []
+        for seg_idx in range(actual_segments):
+            seg_data = segments[:, :, seg_idx, :]
             
-        Returns:
-            Tuple of (predicted embeddings, target embeddings).
-        """
-        emb = self.biot(x, n_channel_offset, perturb=True)
-        emb = self.prediction(emb)
-        pred_emb = self.biot(x, n_channel_offset)
-        return emb, pred_emb
-
-
-class SupervisedPretrain(nn.Module):
-    """Supervised pretraining model for BIOT.
+            # Original processing per segment
+            if self.raw:
+                emb = self.patch_time_embedding(seg_data)
+            else:
+                spec = self.stft(seg_data)
+                emb = self.patch_frequency_embedding(spec)
+            
+            # Add combined positional encoding
+            emb = self.positional_encoding(emb + 
+                self.segment_tokens(seg_idx) + 
+                self.channel_tokens(torch.arange(self.projected_channels))
+            )
+            
+            # Transformer processing
+            transformed = self.base_encoder.transformer(emb)
+            
+            # Store segment embeddings
+            segment_embeddings.append(transformed.mean(dim=1))  # [B, emb_size]
+        
+        # Stack and apply cross-segment attention
+        all_segments = torch.stack(segment_embeddings, dim=1)  # [B, S, E]
+        attn_output, _ = self.segment_attention(
+            all_segments, all_segments, all_segments
+        )
+        return self.segment_layernorm(all_segments + attn_output)
     
-    This model trains the BIOT encoder on multiple tasks simultaneously.
+
+class AttClassificationHead(nn.Module):
+    def __init__(self, emb_size, n_classes):
+        super().__init__()
+        self.attention_pool = nn.MultiheadAttention(emb_size, 1)
+        self.fc = nn.Sequential(
+            nn.LayerNorm(emb_size),
+            nn.Linear(emb_size, n_classes)
+        )
+        
+    def forward(self, x):
+        # x: [B, S, E]
+        attn_output, _ = self.attention_pool(x, x, x)
+        pooled = attn_output.mean(dim=1)
+        return self.fc(pooled)
+
+
+class MultiSegmentBIOTClassifier(nn.Module):
+    """BIOT Classifier for multi-segment classification.
+    
+    This classifier processes chunks of MEG data and outputs a classification
+    score for each segment in the chunk, leveraging contextual information
+    across segments.
     
     Attributes:
-        biot (BIOTEncoder): BIOT encoder for feature extraction.
-        classifier_chb_mit (ClassificationHead): Classification head for CHB-MIT dataset.
-        classifier_iiic_seizure (ClassificationHead): Classification head for IIIC seizure dataset.
-        classifier_tuab (ClassificationHead): Classification head for TUAB dataset.
-        classifier_tuev (ClassificationHead): Classification head for TUEV dataset.
+        encoder (MultiSegmentBIOTEncoder): The encoder for multi-segment processing
+        classifier (ClassificationHead): Classification head for segment-level predictions
     """
     
-    def __init__(self, emb_size: int = 256, heads: int = 8, depth: int = 4, 
-                 raw: bool = False, log_dir: Optional[str] = None, **kwargs):
-        """Initialize the supervised pretraining model.
+    def __init__(
+            self,
+            n_classes: int = 1,
+            n_channels: int = 16,
+            max_segments: int = 16,
+            n_fft: int = 200,
+            hop_length: int = 100,
+            raw: bool = False,
+            patch_size: int = 100,
+            overlap: float = 0.0,
+            emb_size: int = 256,
+            heads: int = 8,
+            depth: int = 4,
+            log_dir: Optional[str] = None,
+            **kwargs
+    ):
+        """Initialize the multi-segment BIOT classifier.
         
         Args:
-            emb_size: Size of the embedding vectors.
-            heads: Number of attention heads.
-            depth: Number of transformer layers.
-            raw: Whether to use raw time-domain processing.
-            log_dir: Optional directory for log files. If None, logs to console only.
-            **kwargs: Additional parameters passed to BIOTEncoder.
+            n_classes: Number of output classes (1 for binary classification)
+            n_channels: Number of input channels
+            max_segments: Maximum number of segments per chunk
+            n_fft: Number of FFT points
+            hop_length: Hop length for STFT
+            raw: Whether to use raw time-domain processing
+            patch_size: Patch size for raw data mode
+            overlap: Overlap between patches for raw data mode
+            emb_size: Size of the embedding vectors
+            heads: Number of attention heads
+            depth: Number of transformer layers
+            log_dir: Optional directory for log files
+            **kwargs: Additional keyword arguments
         """
         super().__init__()
-        self.logger = logging.getLogger(__name__ + ".SupervisedPretrain")
+        self.logger = logging.getLogger(__name__ + ".MultiSegmentBIOTClassifier")
         
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "supervised_pretrain.log"))
+            file_handler = logging.FileHandler(os.path.join(log_dir, "multi_segment_biot_classifier.log"))
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(file_handler)
-            
-        self.logger.info(f"Initializing supervised pretraining model with emb_size={emb_size}, "
-                         f"heads={heads}, depth={depth}, raw={raw}")
         
-        self.biot = BIOTEncoder(emb_size=emb_size, heads=heads, depth=depth, raw=raw, 
-                               log_dir=log_dir, **kwargs)
-        self.classifier_chb_mit = ClassificationHead(emb_size, 1, log_dir=log_dir)
-        self.classifier_iiic_seizure = ClassificationHead(emb_size, 6, log_dir=log_dir)
-        self.classifier_tuab = ClassificationHead(emb_size, 1, log_dir=log_dir)
-        self.classifier_tuev = ClassificationHead(emb_size, 6, log_dir=log_dir)
-
-    def forward(self, x: torch.Tensor, task: str = "chb-mit") -> torch.Tensor:
-        """Forward pass of the supervised pretraining model.
+        # Multi-segment encoder
+        self.encoder = MultiSegmentBIOTEncoder(
+            emb_size=emb_size,
+            heads=heads,
+            depth=depth,
+            n_channels=n_channels,
+            max_segments=max_segments,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            raw=raw,
+            patch_size=patch_size,
+            overlap=overlap,
+            log_dir=log_dir,
+            **kwargs
+        )
+        
+        # Classification head that uses attention pooling
+        self.classifier = AttClassificationHead(
+            emb_size=emb_size,
+            n_classes=n_classes,
+        )
+        
+        self.logger.info(f"Initialized with n_classes={n_classes}, max_segments={max_segments}")
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the multi-segment BIOT classifier.
         
         Args:
-            x: Input tensor of shape (batch_size, channel, ts).
-            task: Which task to perform. Options are "chb-mit", "iiic-seizure", "tuab", or "tuev".
+            x: Input tensor of shape (batch_size, n_channels, total_time)
+                where total_time = n_segments * segment_length
             
         Returns:
-            Logits for the specific task.
+            Logits of shape (batch_size, n_segments, n_classes)
         """
-        x = self.biot(x)
-        if task == "chb-mit":
-            x = self.classifier_chb_mit(x)
-        elif task == "iiic-seizure":
-            x = self.classifier_iiic_seizure(x)
-        elif task == "tuab":
-            x = self.classifier_tuab(x)
-        elif task == "tuev":
-            x = self.classifier_tuev(x)
-        else:
-            error_msg = f"Task {task} is not implemented. Choose from: chb-mit, iiic-seizure, tuab, tuev"
-            self.logger.error(error_msg)
-            raise NotImplementedError(error_msg)
-        return x
+        # Get segment embeddings from encoder
+        segment_embeddings = self.encoder(x)  # (batch_size, n_segments, emb_size)
+        
+        # Apply classifier to each segment
+        batch_size, n_segments, _ = segment_embeddings.shape
+        segment_logits = []
+        
+        for i in range(n_segments):
+            # Extract embeddings for this segment
+            segment_emb = segment_embeddings[:, i]  # (batch_size, emb_size)
+            # Apply classifier
+            logits = self.classifier(segment_emb)  # (batch_size, n_classes)
+            segment_logits.append(logits)
+        
+        # Stack segment logits
+        logits = torch.stack(segment_logits, dim=1)  # (batch_size, n_segments, n_classes)
+        
+        return logits
 
 
 def setup_logging(log_dir: Optional[str] = None, log_level: int = logging.INFO):
@@ -884,20 +821,5 @@ if __name__ == "__main__":
         )
         out_raw_overlap = model_raw_overlap(x)
         logger.info(f"Raw output shape (with overlap): {out_raw_overlap.shape}")
-
-    # Test unsupervised pretraining
-    logger.info("Testing unsupervised pretraining model")
-    model_unsup = UnsupervisedPretrain(
-        n_fft=args.n_fft, 
-        hop_length=args.hop_length, 
-        depth=4, 
-        heads=8, 
-        raw=args.raw, 
-        patch_size=args.patch_size,
-        overlap=args.overlap,
-        log_dir=args.log_dir
-    )
-    out1, out2 = model_unsup(x)
-    logger.info(f"Unsupervised output shapes: {out1.shape}, {out2.shape}")
     
     logger.info("All tests completed successfully")

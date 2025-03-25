@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 import pickle
 import torch
+import torch.nn.functional as F
 import numpy as np
 import os
 from scipy.signal import resample
@@ -1202,6 +1203,275 @@ def BCE(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return loss.mean()
 
 
+def temporal_consistency_loss(
+    y_hat: torch.Tensor,
+    y: torch.Tensor,
+    consistency_weight: float = 0.3,
+    smoothness_window: int = 3
+) -> torch.Tensor:
+    """Calculate temporal consistency loss for spike detection.
+    
+    This loss encourages:
+    1. Similar predictions for adjacent segments with the same label
+    2. Smooth transitions even when labels change (avoiding sudden jumps)
+    3. Gradual onset/offset for detected spikes
+    
+    Args:
+        y_hat: Predicted values of shape (batch_size, n_segments, 1)
+        y: True values of shape (batch_size, n_segments)
+        consistency_weight: Weight for temporal consistency term
+        smoothness_window: Window size for calculating smoothness
+        
+    Returns:
+        Temporal consistency loss
+    """
+    batch_size, n_segments, _ = y_hat.shape
+    device = y_hat.device
+    
+    # Create empty loss
+    consistency_loss = torch.tensor(0.0, device=device)
+    
+    # Skip if we have only one segment or consistency weight is zero
+    if n_segments <= 1 or consistency_weight <= 0:
+        return consistency_loss
+    
+    # Get probabilities from logits
+    probs = torch.sigmoid(y_hat).view(batch_size, n_segments)
+    y = y.float()
+    
+    # 1. Label consistency loss: adjacent segments with same label should have similar predictions
+    for i in range(n_segments - 1):
+        # Check if adjacent segments have the same label
+        same_label = (y[:, i] == y[:, i + 1]).float()
+        
+        # Difference between predictions for adjacent segments
+        pred_diff = torch.abs(probs[:, i] - probs[:, i + 1])
+        
+        # Penalize differences when labels are the same
+        label_consistency = (pred_diff * same_label).mean()
+        consistency_loss = consistency_loss + label_consistency
+    
+    # 2. Smoothness loss: avoid sudden changes in predictions
+    if n_segments >= smoothness_window:
+        for i in range(n_segments - smoothness_window + 1):
+            # Get window of predictions
+            window = probs[:, i:i+smoothness_window]
+            
+            # Calculate variance within the window
+            window_mean = window.mean(dim=1, keepdim=True)
+            window_var = ((window - window_mean) ** 2).mean(dim=1)
+            
+            # Add to total loss
+            consistency_loss = consistency_loss + window_var.mean()
+    
+    # 3. Transitional smoothness: for spike onset/offset
+    if n_segments >= 3:
+        for i in range(1, n_segments - 1):
+            # Check for transition points (label changes)
+            is_transition = ((y[:, i-1] != y[:, i]) | (y[:, i] != y[:, i+1])).float()
+            
+            # Calculate mean squared error of second derivative (measure of "jerkiness")
+            second_deriv = torch.abs(probs[:, i+1] - 2*probs[:, i] + probs[:, i-1])
+            
+            # Penalize non-smooth transitions at label change points
+            transition_loss = (second_deriv * is_transition).mean()
+            consistency_loss = consistency_loss + transition_loss
+    
+    # Normalize by number of segments
+    consistency_loss = consistency_loss / n_segments
+    
+    return consistency_weight * consistency_loss
+
+
+def enhanced_focal_loss(
+    y_hat: torch.Tensor,
+    y: torch.Tensor,
+    class_weights: Dict[int, float],
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+    temporal_consistency: bool = True,
+    consistency_weight: float = 0.3
+) -> torch.Tensor:
+    """Enhanced focal loss with temporal consistency for spike detection.
+    
+    Combines focal loss (which focuses on hard examples) with a temporal consistency
+    term that encourages smooth and consistent predictions across segments.
+    
+    Args:
+        y_hat: Predicted values (batch_size, n_segments, 1)
+        y: True values (batch_size, n_segments)
+        class_weights: Dictionary mapping class indices to weights
+        gamma: Focusing parameter for focal loss
+        alpha: Balance parameter for focal loss
+        temporal_consistency: Whether to add temporal consistency term
+        consistency_weight: Weight for temporal consistency term
+        
+    Returns:
+        Combined loss value
+    """
+    batch_size, n_segments, _ = y_hat.shape
+    
+    # Flatten predictions and targets for focal loss calculation
+    y_flat = y.reshape(-1, 1).float()  # (batch_size * n_segments, 1)
+    y_hat_flat = y_hat.reshape(-1, 1)  # (batch_size * n_segments, 1)
+    
+    # Create weight tensor based on class weights
+    weights = torch.ones_like(y_flat, device=y_hat.device)
+    weights[y_flat == 0] = class_weights[0]  # Weight for non-spike
+    weights[y_flat == 1] = class_weights[1]  # Weight for spike
+    
+    # Get probabilities
+    p = torch.sigmoid(y_hat_flat)
+    
+    # Calculate pt (probability of the correct class)
+    pt = p * y_flat + (1 - p) * (1 - y_flat)
+    
+    # Focal weight based on how hard the example is
+    focal_weight = (1 - pt) ** gamma
+    
+    # Alpha weighting for class balance
+    alpha_weight = alpha * y_flat + (1 - alpha) * (1 - y_flat)
+    
+    # Combine all weights
+    combined_weight = weights * alpha_weight * focal_weight
+    
+    # Binary cross-entropy
+    bce = -torch.log(pt + 1e-12)  # Add epsilon for numerical stability
+    
+    # Calculate weighted focal loss
+    focal_loss_val = (combined_weight * bce).mean()
+    
+    # Add temporal consistency loss if requested
+    if temporal_consistency and n_segments > 1:
+        consistency_loss = temporal_consistency_loss(
+            y_hat, y, 
+            consistency_weight=consistency_weight
+        )
+        return focal_loss_val + consistency_loss
+    else:
+        return focal_loss_val
+
+
+def spike_aware_loss(
+    y_hat: torch.Tensor, 
+    y: torch.Tensor,
+    class_weights: Dict[int, float],
+    onset_weight: float = 2.0,
+    offset_weight: float = 1.5,
+    base_weight: float = 1.0,
+    temporal_weight: float = 0.3
+) -> torch.Tensor:
+    """Special loss function for spike detection that emphasizes onset and offset detection.
+    
+    This loss function:
+    1. Applies higher weights to spike onset/offset points to improve boundary detection
+    2. Applies class weights to handle imbalance
+    3. Adds temporal consistency to encourage smooth predictions
+    
+    Args:
+        y_hat: Predicted values (batch_size, n_segments, 1)
+        y: True values (batch_size, n_segments)
+        class_weights: Dictionary mapping class indices to weights
+        onset_weight: Weight multiplier for spike onset points
+        offset_weight: Weight multiplier for spike offset points
+        base_weight: Base weight for non-transition points
+        temporal_weight: Weight for temporal consistency term
+        
+    Returns:
+        Combined loss value
+    """
+    batch_size, n_segments, _ = y_hat.shape
+    device = y_hat.device
+    
+    # Apply sigmoid to get probabilities
+    probs = torch.sigmoid(y_hat).view(batch_size, n_segments)
+    y = y.float()
+    
+    # Create weight tensor based on class weights
+    weights = torch.ones(batch_size, n_segments, device=device)
+    weights[y == 0] = class_weights[0] * base_weight
+    weights[y == 1] = class_weights[1] * base_weight
+    
+    # Find spike onset and offset points (transitions from 0->1 and 1->0)
+    if n_segments > 1:
+        for i in range(1, n_segments):
+            # Onset: previous is 0, current is 1
+            onset_mask = (y[:, i-1] == 0) & (y[:, i] == 1)
+            # Offset: previous is 1, current is 0
+            offset_mask = (y[:, i-1] == 1) & (y[:, i] == 0)
+            
+            # Apply higher weights to these points
+            weights[onset_mask, i] *= onset_weight
+            weights[offset_mask, i] *= offset_weight
+    
+    # Calculate BCE loss
+    bce = F.binary_cross_entropy(probs, y, reduction='none')
+    
+    # Apply weights
+    weighted_bce = (weights * bce).mean()
+    
+    # Add temporal consistency
+    consistency_loss = temporal_consistency_loss(
+        y_hat, y, 
+        consistency_weight=temporal_weight
+    )
+    
+    return weighted_bce + consistency_loss
+
+
+def hierarchical_spike_loss(
+    y_hat: torch.Tensor,
+    y: torch.Tensor,
+    class_weights: Optional[Dict[int, float]] = None,
+    sequence_weight: float = 0.4
+) -> torch.Tensor:
+    """Hierarchical loss that considers both segment-level and sequence-level spike detection.
+    
+    This loss operates on two levels:
+    1. Segment-level: Standard binary classification of each segment
+    2. Sequence-level: Detection of spike sequences in the chunk
+    
+    Args:
+        y_hat: Predicted values (batch_size, n_segments, 1)
+        y: True values (batch_size, n_segments)
+        class_weights: Optional dictionary mapping class indices to weights
+        sequence_weight: Weight for sequence-level component
+        
+    Returns:
+        Combined loss value
+    """
+    batch_size, n_segments, _ = y_hat.shape
+    device = y_hat.device
+    
+    # Default class weights if not provided
+    if class_weights is None:
+        class_weights = {0: 1.0, 1: 1.0}
+    
+    # 1. Segment-level component: enhanced focal loss
+    segment_loss = enhanced_focal_loss(
+        y_hat, y, 
+        class_weights=class_weights,
+        temporal_consistency=True
+    )
+    
+    # 2. Sequence-level component: detect if the chunk contains any spikes
+    # Aggregate predictions across segments
+    seg_probs = torch.sigmoid(y_hat).view(batch_size, n_segments)
+    
+    # Create chunk-level target: 1 if any segment has a spike, 0 otherwise
+    chunk_target = (y.sum(dim=1) > 0).float().view(batch_size, 1)
+    
+    # Create chunk-level prediction: max probability across segments
+    chunk_pred = seg_probs.max(dim=1)[0].view(batch_size, 1)
+    
+    # Calculate chunk-level loss
+    chunk_loss = F.binary_cross_entropy(chunk_pred, chunk_target)
+    
+    # Combine losses
+    total_loss = (1 - sequence_weight) * segment_loss + sequence_weight * chunk_loss
+    
+    return total_loss
+
 def relaxed_scores(true, pred):
     """
     Calculate relaxed metrics allowing detections to be 1 window away from the ground truth.
@@ -1266,3 +1536,72 @@ def relaxed_scores(true, pred):
     }
 
     return relaxed_metrics
+
+
+
+
+def relaxed_scores(true, pred):
+    """
+    Calculate relaxed metrics allowing detections to be 1 window away from the ground truth.
+
+    Args:
+        true: Array of ground truth labels
+        pred: Array of predictions
+
+    Returns:
+        Dictionary containing relaxed metrics
+    """
+    relaxed_pred = np.zeros_like(pred)
+
+    for ind, l in enumerate(true):
+        # Left boundary condition
+        if ind == 0:
+            if l == 1:
+                if (pred[ind] == 1 or pred[ind + 1] == 1):
+                    relaxed_pred[ind] = 1
+            elif pred[ind] == 1 and true[ind + 1] == 0:
+                relaxed_pred[ind] = 1
+        # Right boundary condition
+        elif ind == true.shape[0] - 1:
+            if l == 1:
+                if (pred[ind] == 1 or pred[ind - 1] == 1):
+                    relaxed_pred[ind] = 1
+            elif pred[ind] == 1 and true[ind - 1] == 0:
+                relaxed_pred[ind] = 1
+                # General case
+        elif l == 1:
+            if (pred[ind - 1] == 1 or pred[ind] == 1 or pred[ind + 1] == 1):
+                relaxed_pred[ind] = 1
+        elif pred[ind] == 1 and true[ind + 1] == 0 and true[ind - 1] == 0:
+            relaxed_pred[ind] = 1
+
+    # Calculate relaxed metrics
+    relaxed_tp = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 1)))
+    relaxed_tn = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 0)))
+    relaxed_fp = len(np.intersect1d(np.where(true == 0), np.where(relaxed_pred == 1)))
+    relaxed_fn = len(np.intersect1d(np.where(true == 1), np.where(relaxed_pred == 0)))
+
+    # Calculate metrics, handling edge cases
+    relaxed_f1 = (2 * relaxed_tp) / (2 * relaxed_tp + relaxed_fp + relaxed_fn) if (
+                2 * relaxed_tp + relaxed_fp + relaxed_fn) else 1
+    relaxed_precision = (relaxed_tp / (relaxed_tp + relaxed_fp)) if (relaxed_tp + relaxed_fp) else 1
+    relaxed_recall = relaxed_sens = (relaxed_tp / (relaxed_tp + relaxed_fn)) if (relaxed_tp + relaxed_fn) else 1
+    relaxed_spec = (relaxed_tn / (relaxed_tn + relaxed_fp)) if (relaxed_tn + relaxed_fp) else 1
+    relaxed_acc = (relaxed_tp + relaxed_tn) / (relaxed_tp + relaxed_tn + relaxed_fp + relaxed_fn)
+
+    # Create a dictionary of relaxed metrics
+    relaxed_metrics = {
+        "relaxed_f1": relaxed_f1,
+        "relaxed_precision": relaxed_precision,
+        "relaxed_recall": relaxed_recall,
+        "relaxed_sensitivity": relaxed_sens,
+        "relaxed_specificity": relaxed_spec,
+        "relaxed_accuracy": relaxed_acc,
+        "relaxed_tp": relaxed_tp,
+        "relaxed_tn": relaxed_tn,
+        "relaxed_fp": relaxed_fp,
+        "relaxed_fn": relaxed_fn
+    }
+
+    return relaxed_metrics
+

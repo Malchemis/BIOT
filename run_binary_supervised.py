@@ -9,6 +9,7 @@ from datetime import datetime
 # Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -17,7 +18,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
-from model import BIOTSequenceClassifier
+from model import MultiSegmentBIOTClassifier
 from utils import MEGDataset, weighted_BCE, BCE
 
 import torch
@@ -47,18 +48,12 @@ class LitModel_finetune(pl.LightningModule):
             The calculated loss
         """
         X, y = batch
-        prob = self.model(X)
-
-        # # For debugging: print actual probabilities (0-1 range)
-        # if batch_idx == 0:  # Only print for first batch to avoid spam
-        #     probs_sigmoid = torch.sigmoid(prob)
-        #     self.custom_logger.info(f"Probabilities after sigmoid: {probs_sigmoid[0][:100]}")
-        #     self.custom_logger.info(f"Ground truth: {y[0][:100]}")
+        logits = self.model(X)
 
         # Option 1: Original BCE loss (no weighting)
         # loss = BCE(prob, y)
         # Option 2: Weighted BCE with class-specific weights
-        loss = weighted_BCE(prob, y, self.class_weights)
+        loss = weighted_BCE(logits, y, self.class_weights)
         # Option 3: Original focal loss
         # loss = focal_loss(prob, y, gamma=2.0, alpha=0.25)
         # Option 4: Focal loss with class weights
@@ -79,12 +74,12 @@ class LitModel_finetune(pl.LightningModule):
         """
         X, y = batch
         with torch.no_grad():
-            prob = self.model(X)
-            step_result = torch.sigmoid(prob).cpu().numpy()
+            logits = self.model(X)
+            step_probs = torch.sigmoid(logits).cpu().numpy()
             step_gt = y.cpu().numpy()
         # Append the result to the list
-        self.validation_step_outputs.append((step_result, step_gt))
-        return step_result, step_gt
+        self.validation_step_outputs.append((step_probs, step_gt))
+        return step_probs, step_gt
 
     def on_validation_epoch_start(self):
         """Initialize validation outputs collection at the start of validation."""
@@ -360,20 +355,29 @@ def supervised(args):
         train_loader, test_loader, val_loader, input_shape, output_shape, class_weights = prepare_meg_dataloader(args)
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented")
+    
+    # Log information about data shapes
+    batch_size, n_channels, total_time = input_shape
+    batch_size, n_segments = output_shape
+    logger.info(f"Input shape: {input_shape}, Output shape: {output_shape}")
+    logger.info(f"Detected {n_segments} segments per chunk")
 
     # Define the model
     logger.info(f"Initializing model: {args.model}")
     if args.model == "BIOT":
-        model = BIOTSequenceClassifier(
+        model = MultiSegmentBIOTClassifier(
             n_classes=1,
             n_channels=args.in_channels,
-            n_segments=output_shape[1], # shape 0 is batch size, 1 is number of segments=chunk_size
-            seq_method='lstm', # 'lstm', 'attention', 'gating'
+            max_segments=n_segments,  # Use the number of segments from the data
             n_fft=args.token_size,
             hop_length=args.hop_length,
-            raw=args.raw, 
-            patch_size=args.patch_size, 
+            raw=args.raw,
+            patch_size=args.patch_size,
             overlap=args.overlap,
+            emb_size=256,  # Default embedding size
+            heads=8,       # Default number of heads
+            depth=4,       # Default transformer depth
+            log_dir=args.log_dir
         )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
@@ -425,6 +429,7 @@ def supervised(args):
         logger=tensorboard_logger,
         max_epochs=args.epochs,
         callbacks=[early_stop_callback, best_checkpoint_callback, last_checkpoint_callback],
+        log_every_n_steps=1,
     )
 
     # Train the model
