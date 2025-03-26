@@ -11,11 +11,11 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+import lightning as pl
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
 from model import MultiSegmentBIOTClassifier
@@ -53,13 +53,12 @@ class LitModel_finetune(pl.LightningModule):
         # Option 1: Original BCE loss (no weighting)
         # loss = BCE(prob, y)
         # Option 2: Weighted BCE with class-specific weights
-        loss = weighted_BCE(logits, y, self.class_weights)
+        loss = BCE(logits, y)#, self.class_weights)
         # Option 3: Original focal loss
         # loss = focal_loss(prob, y, gamma=2.0, alpha=0.25)
         # Option 4: Focal loss with class weights
         # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
         self.log("train_loss", loss)
-        self.custom_logger.info(f"Training loss: {loss}")
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -535,7 +534,7 @@ if __name__ == "__main__":
     # Training parameters
     parser.add_argument("--epochs", type=int, default=100, help="number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-5, help="weight decay")
+    parser.add_argument("--weight_decay", type=float, default=3e-5, help="weight decay")
     parser.add_argument("--batch_size", type=int, default=512, help="batch size")
     parser.add_argument("--num_workers", type=int, default=32, help="number of workers")
     parser.add_argument("--patience", type=int, default=5, help="patience for early stopping")

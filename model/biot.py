@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.MultiheadAttention
+from torch.nn import MultiheadAttention
 import numpy as np
 from linear_attention_transformer import LinearAttentionTransformer
 
@@ -301,7 +301,7 @@ class BIOTEncoder(nn.Module):
         self.positional_encoding = PositionalEncoding(emb_size, log_dir=log_dir)
 
         # Channel token, N_channels >= your actual channels
-        self.channel_tokens = nn.Embedding(n_channels, 256)
+        self.channel_tokens = nn.Embedding(n_channels, emb_size)
         self.index = nn.Parameter(
             torch.LongTensor(range(n_channels)), requires_grad=False
         )
@@ -319,7 +319,7 @@ class BIOTEncoder(nn.Module):
             input=sample.squeeze(1),  # from shape (batch_size, 1, ts) to (batch_size, ts)
             n_fft=self.n_fft,
             hop_length=self.hop_length,
-            # window=torch.hann_window(self.n_fft).to(sample.device),
+            window=torch.ones(self.n_fft, device=sample.device),
             center=False,
             onesided=True,
             return_complex=True,
@@ -456,7 +456,7 @@ class MultiSegmentBIOTEncoder(nn.Module):
             depth: int = 4,
             n_channels: int = 275,
             n_projected_channels: int = 64,
-            max_segments: int = 16,  # Maximum number of segments in a chunk
+            max_segments: int = 300,  # Maximum number of segments in a chunk
             n_fft: int = 200,
             hop_length: int = 100,
             raw: bool = False,
@@ -519,12 +519,14 @@ class MultiSegmentBIOTEncoder(nn.Module):
             torch.arange(max_segments), requires_grad=False
         )
 
-        self.segment_attention = MultiHeadAttention(emb_size, heads)
+        self.segment_attention = MultiheadAttention(emb_size, heads)
         self.segment_layer_norm = nn.LayerNorm(emb_size)
 
         
         # Save parameters
+        self.raw = raw
         self.n_channels = n_channels
+        self.projected_channels = n_projected_channels
         self.max_segments = max_segments
         self.emb_size = emb_size
         self.segment_length = None  # Will be determined during first forward pass
@@ -541,15 +543,15 @@ class MultiSegmentBIOTEncoder(nn.Module):
         Returns:
             Segment embeddings of shape (batch_size, n_segments, emb_size)
         """
-        # Modified segment processing
         batch_size, n_channels, total_time = x.shape
         
         # Calculate exact segment length
         self.segment_length = total_time // self.max_segments
         actual_segments = min(total_time // self.segment_length, self.max_segments)
+        actual_segments = torch.tensor(actual_segments, device=x.device, dtype=torch.long)
         
-        # Process all channels simultaneously
-        projected = self.channel_projection(x)  # [B, C_proj, T]
+        # Channel projection
+        projected = self.channel_reduction(x)  # [B, C_proj, T]
         
         # Reshape to segments [B, C_proj, S, L]
         segments = projected.view(
@@ -559,37 +561,65 @@ class MultiSegmentBIOTEncoder(nn.Module):
             self.segment_length
         )
         
-        # Process each segment independently
         segment_embeddings = []
         for seg_idx in range(actual_segments):
-            seg_data = segments[:, :, seg_idx, :]
+            seg_data = segments[:, :, seg_idx, :]  # [B, C_proj, L]
             
-            # Original processing per segment
             if self.raw:
-                emb = self.patch_time_embedding(seg_data)
+                # Process each projected channel individually for raw data
+                channel_embs = []
+                for chan_idx in range(self.projected_channels):
+                    chan_data = seg_data[:, chan_idx:chan_idx+1, :]  # [B, 1, L]
+                    
+                    # Process through patch_time_embedding
+                    chan_emb = self.base_encoder.patch_time_embedding(chan_data)
+                    
+                    # Add channel token
+                    chan_token = self.base_encoder.channel_tokens(
+                        self.base_encoder.index[chan_idx].long()
+                    ).view(1, 1, -1)
+                    chan_emb += chan_token
+                    
+                    channel_embs.append(chan_emb)
+                
+                # Combine channel embeddings
+                emb = torch.stack(channel_embs, dim=1).mean(dim=1)  # [B, T, E]
             else:
-                spec = self.stft(seg_data)
-                emb = self.patch_frequency_embedding(spec)
+                # Process each projected channel individually for spectral processing
+                channel_embs = []
+                for chan_idx in range(self.projected_channels):
+                    # Extract single channel data [B, 1, L]
+                    chan_data = seg_data[:, chan_idx:chan_idx+1, :]
+                    
+                    # STFT processing
+                    spec = self.base_encoder.stft(chan_data)  # [B, Freq, Time]
+                    chan_emb = self.base_encoder.patch_frequency_embedding(spec)
+                    
+                    # Add channel embedding
+                    chan_token = self.base_encoder.channel_tokens(
+                        self.base_encoder.index[chan_idx].long() # ensure long type
+                    ).unsqueeze(0).unsqueeze(0)  # [1, 1, E]
+                    chan_emb += chan_token
+                    
+                    channel_embs.append(chan_emb)
+                
+                # Combine channel embeddings
+                emb = torch.stack(channel_embs, dim=1).mean(dim=1)  # [B, T, E]
             
-            # Add combined positional encoding
-            emb = self.positional_encoding(emb + 
-                self.segment_tokens(seg_idx) + 
-                self.channel_tokens(torch.arange(self.projected_channels))
-            )
+            # Add segment embedding and positional encoding
+            seg_idx_tensor = torch.tensor([seg_idx], device=x.device, dtype=torch.long)
+            emb += self.segment_tokens(seg_idx_tensor).view(1, 1, -1)  # from [1, E] to [1, 1, E] for broadcasting
+            emb = self.base_encoder.positional_encoding(emb)
             
             # Transformer processing
             transformed = self.base_encoder.transformer(emb)
-            
-            # Store segment embeddings
-            segment_embeddings.append(transformed.mean(dim=1))  # [B, emb_size]
+            segment_embeddings.append(transformed.mean(dim=1))  # [B, E]
+
+        # Rest of the code remains the same
+        all_segments = torch.stack(segment_embeddings, dim=1)
+        attn_output, _ = self.segment_attention(all_segments, all_segments, all_segments)
+        return self.segment_layer_norm(all_segments + attn_output)
         
-        # Stack and apply cross-segment attention
-        all_segments = torch.stack(segment_embeddings, dim=1)  # [B, S, E]
-        attn_output, _ = self.segment_attention(
-            all_segments, all_segments, all_segments
-        )
-        return self.segment_layernorm(all_segments + attn_output)
-    
 
 class AttClassificationHead(nn.Module):
     def __init__(self, emb_size, n_classes):
@@ -599,12 +629,13 @@ class AttClassificationHead(nn.Module):
             nn.LayerNorm(emb_size),
             nn.Linear(emb_size, n_classes)
         )
-        
+
     def forward(self, x):
-        # x: [B, S, E]
+        # x shape: [B, S, E]
+        x = x.permute(1, 0, 2)  # [S, B, E] for MHA
         attn_output, _ = self.attention_pool(x, x, x)
-        pooled = attn_output.mean(dim=1)
-        return self.fc(pooled)
+        attn_output = attn_output.permute(1, 0, 2)  # [B, S, E]
+        return self.fc(attn_output)  # [B, S, n_classes]
 
 
 class MultiSegmentBIOTClassifier(nn.Module):
@@ -695,24 +726,12 @@ class MultiSegmentBIOTClassifier(nn.Module):
         Returns:
             Logits of shape (batch_size, n_segments, n_classes)
         """
-        # Get segment embeddings from encoder
-        segment_embeddings = self.encoder(x)  # (batch_size, n_segments, emb_size)
+        # Get all segment embeddings [B, S, E]
+        segment_embeddings = self.encoder(x)  
         
-        # Apply classifier to each segment
-        batch_size, n_segments, _ = segment_embeddings.shape
-        segment_logits = []
-        
-        for i in range(n_segments):
-            # Extract embeddings for this segment
-            segment_emb = segment_embeddings[:, i]  # (batch_size, emb_size)
-            # Apply classifier
-            logits = self.classifier(segment_emb)  # (batch_size, n_classes)
-            segment_logits.append(logits)
-        
-        # Stack segment logits
-        logits = torch.stack(segment_logits, dim=1)  # (batch_size, n_segments, n_classes)
-        
-        return logits
+        # Process all segments simultaneously
+        logits = self.classifier(segment_embeddings)  # [B, S, 1]
+        return logits.squeeze(-1)  # [B, S]
 
 
 def setup_logging(log_dir: Optional[str] = None, log_level: int = logging.INFO):
