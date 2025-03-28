@@ -3,6 +3,7 @@ import os
 import argparse
 import logging
 from datetime import datetime
+from tqdm import tqdm
 
 # # we want to debug so we set
 # For debugging consider passing CUDA_LAUNCH_BLOCKING=1
@@ -18,12 +19,69 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from pyhealth.metrics import binary_metrics_fn
 
-from model import MultiSegmentBIOTClassifier
-from utils import MEGDataset, weighted_BCE, BCE
+from model import BIOTHierarchicalEncoder
+from utils import MEGDataset, focal_loss, focal_loss_with_class_weights, weighted_BCE
 
 import torch
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, confusion_matrix#, f1_score, accuracy_score
+
+
+class ProjectionLayerCallback(pl.Callback):
+    """Callback to handle channel projection layer freezing.
+    
+    This callback implements a strategy to freeze the projection layer
+    after a certain number of epochs or when validation metrics reach a plateau.
+    """
+    
+    def __init__(self, freeze_after_epochs=10, freeze_on_plateau=True, patience=3):
+        """Initialize the projection layer callback.
+        
+        Args:
+            freeze_after_epochs: Number of epochs after which to freeze the projection
+            freeze_on_plateau: Whether to freeze on validation metric plateau
+            patience: Number of epochs to wait for improvement before freezing on plateau
+        """
+        super().__init__()
+        self.freeze_after_epochs = freeze_after_epochs
+        self.freeze_on_plateau = freeze_on_plateau
+        self.patience = patience
+        self.best_val_metric = 0
+        self.epochs_without_improvement = 0
+        self.frozen = False
+        self.logger = logging.getLogger(__name__ + ".ProjectionLayerCallback")
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Check whether to freeze the projection layer at the end of each epoch."""
+        current_epoch = trainer.current_epoch
+        
+        # Check if we should freeze based on epoch count
+        if not self.frozen and current_epoch >= self.freeze_after_epochs:
+            self._freeze_projection(pl_module)
+            return
+            
+        # Check if we should freeze based on validation plateau
+        if self.freeze_on_plateau and not self.frozen:
+            current_val_metric = trainer.callback_metrics.get('val_pr_auc', 0)
+            
+            if current_val_metric > self.best_val_metric:
+                self.best_val_metric = current_val_metric
+                self.epochs_without_improvement = 0
+            else:
+                self.epochs_without_improvement += 1
+                
+            if self.epochs_without_improvement >= self.patience:
+                self.logger.info(f"Validation metric plateaued for {self.patience} epochs.")
+                self._freeze_projection(pl_module)
+    
+    def _freeze_projection(self, pl_module):
+        """Freeze the projection layer in the model."""
+        if hasattr(pl_module.model, 'freeze_projection'):
+            pl_module.model.freeze_projection()
+            self.frozen = True
+            self.logger.info("Projection layer frozen after training phase.")
+        else:
+            self.logger.warning("Model does not have freeze_projection method.")
 
 
 class LitModel_finetune(pl.LightningModule):
@@ -53,11 +111,11 @@ class LitModel_finetune(pl.LightningModule):
         # Option 1: Original BCE loss (no weighting)
         # loss = BCE(prob, y)
         # Option 2: Weighted BCE with class-specific weights
-        loss = BCE(logits, y)#, self.class_weights)
+        #loss = weighted_BCE(logits, y, self.class_weights)
         # Option 3: Original focal loss
         # loss = focal_loss(prob, y, gamma=2.0, alpha=0.25)
         # Option 4: Focal loss with class weights
-        # loss = focal_loss_with_class_weights(prob, y, self.class_weights, gamma=2.0)
+        loss = focal_loss_with_class_weights(logits, y, self.class_weights, gamma=2.0)
         self.log("train_loss", loss)
         return loss
 
@@ -164,10 +222,7 @@ class LitModel_finetune(pl.LightningModule):
         self.test_step_outputs = []
 
     def on_test_epoch_end(self):
-        """Calculate test metrics including relaxed scores for spike detection.
-        
-        Works with both single-output and multi-output (chunk) mode.
-        """
+        """Calculate test metrics including relaxed scores for spike detection."""
         test_step_outputs = self.test_step_outputs
         result = np.array([])
         gt = np.array([])
@@ -258,7 +313,7 @@ def seed_worker(worker_id):
 
 
 def prepare_meg_dataloader(args):
-    """Prepare dataloaders for MEG dataset.
+    """Prepare dataloaders for MEG dataset
     
     Args:
         args: Command-line arguments containing dataset parameters
@@ -287,29 +342,26 @@ def prepare_meg_dataloader(args):
     test_files = os.listdir(os.path.join(root, "test"))
 
     logger.info(f"Size of train, val, and test file list: {len(train_files)}, {len(val_files)}, {len(test_files)}")
+    
+    # Load datasets
     train_set = MEGDataset.from_processed_dir(root, "train", use_weights=True, cache_size=100, metadata_only=False)
     val_set = MEGDataset.from_processed_dir(root, "val", use_weights=True, cache_size=100, metadata_only=False)
     test_set = MEGDataset.from_processed_dir(root, "test", use_weights=True, cache_size=100, metadata_only=False)
+    
     logger.info(f"Size of train, val, and test sets: {len(train_set)}, {len(val_set)}, {len(test_set)}")
     logger.info(f"Size of a sample from train, val, and test sets: {train_set[0][0].size()}, {val_set[0][0].size()}, {test_set[0][0].size()}")
-    # Prepare training and test data loader
+    
+    # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_set,
-        batch_size=args.batch_size,
         shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-        worker_init_fn=seed_worker
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_set,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.num_workers,
         persistent_workers=True,
         worker_init_fn=seed_worker
     )
+    
+    # For validation and test, we don't need shuffling
     val_loader = torch.utils.data.DataLoader(
         val_set,
         batch_size=args.batch_size,
@@ -318,8 +370,19 @@ def prepare_meg_dataloader(args):
         persistent_workers=True,
         worker_init_fn=seed_worker
     )
+    
+    test_loader = torch.utils.data.DataLoader(
+        test_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+        worker_init_fn=seed_worker
+    )
+    
     logger.info(f"Size of train, val, and test loaders: {len(train_loader)}, {len(val_loader)}, {len(test_loader)}")
-    # test each loader to get a batch
+    
+    # Test each loader to get a batch
     for _, (X, y) in enumerate(train_loader):
         logger.info(f"Train loader: {X.shape}, {y.shape}")
         break
@@ -329,6 +392,7 @@ def prepare_meg_dataloader(args):
     for _, (X, y) in enumerate(test_loader):
         logger.info(f"Test loader: {X.shape}, {y.shape}")
         break
+    
     return train_loader, test_loader, val_loader, X.shape, y.shape, train_set.class_weights
 
 
@@ -340,51 +404,58 @@ def supervised(args):
     """
     logger = logging.getLogger(__name__)
     
-    # Setup logging
+    #  Setup logging
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_file = os.path.join(args.log_dir, f"{args.dataset}-{args.model}-{timestamp}.log")
+    log_file = os.path.join(args.log_dir, f"{args.dataset}-{args.model}-projection-{timestamp}.log")
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(file_handler)
     
-    # Get data loaders
+    # Get data loaders with stratified batching if enabled
     logger.info(f"Preparing data loaders for dataset: {args.dataset}")
-    if args.dataset == "MEG":
-        train_loader, test_loader, val_loader, input_shape, output_shape, class_weights = prepare_meg_dataloader(args)
-    else:
-        raise NotImplementedError(f"Dataset {args.dataset} not implemented")
+    train_loader, test_loader, val_loader, input_shape, output_shape, class_weights = prepare_meg_dataloader(args)
     
     # Log information about data shapes
-    batch_size, n_channels, total_time = input_shape
+    batch_size, n_segments, n_channels, n_samples_per_segment = input_shape
     batch_size, n_segments = output_shape
-    logger.info(f"Input shape: {input_shape}, Output shape: {output_shape}")
-    logger.info(f"Detected {n_segments} segments per chunk")
+    logger.info(f"Input shape: Batch size: {batch_size}, Segments: {n_segments}, Channels: {n_channels}, Samples per segment: {n_samples_per_segment}")
+    logger.info(f"Output shape: Batch size: {batch_size}, Segments: {n_segments}")
+    logger.info(f"Will project {n_channels} original channels to {args.n_projected_channels} channels using '{args.projection_strategy}' strategy")
 
-    # Define the model
+    # Define the model with channel projection
     logger.info(f"Initializing model: {args.model}")
     if args.model == "BIOT":
-        model = MultiSegmentBIOTClassifier(
+        model = BIOTHierarchicalEncoder(
             n_classes=1,
-            n_channels=args.in_channels,
-            max_segments=n_segments,  # Use the number of segments from the data
-            n_fft=args.token_size,
-            hop_length=args.hop_length,
-            raw=args.raw,
-            patch_size=args.patch_size,
+            n_channels=n_channels,
+            n_projected_channels=args.n_projected_channels,
+            n_segments=n_segments,
+            token_size=args.token_size,
             overlap=args.overlap,
-            emb_size=256,  # Default embedding size
-            heads=8,       # Default number of heads
-            depth=4,       # Default transformer depth
+            raw=args.raw,
+            emb_size=256,
+            heads=8,
+            segment_encoder_depth=4,
+            inter_segment_depth=4,
+            projection_strategy=args.projection_strategy,
+            freeze_projection=args.freeze_projection,
             log_dir=args.log_dir
         )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
         
-    lightning_model = LitModel_finetune.load_from_checkpoint(args.pretrain_model_path, args=args, model=model, class_weights=class_weights) if args.pretrain_model_path else LitModel_finetune(args, model, class_weights=class_weights)
+    # Create lightning model with projection samples
+    lightning_model = LitModel_finetune(
+        args=args, 
+        model=model, 
+        class_weights=class_weights,
+    )
 
     # Logger and callbacks
-    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{args.epochs}-{timestamp}"
+    projection_info = f"proj{args.n_projected_channels}-{args.projection_strategy}"
+    version = f"{args.dataset}-{args.model}-{projection_info}-{timestamp}"
+    
     tensorboard_logger = TensorBoardLogger(
         save_dir=args.model_log_dir,
         version=version,
@@ -394,30 +465,46 @@ def supervised(args):
     dirpath = tensorboard_logger.log_dir
     os.makedirs(dirpath, exist_ok=True)
 
-    # Early stopping to monitor PR AUC
-    early_stop_callback = EarlyStopping(
-        monitor="val_pr_auc", patience=args.patience, verbose=True, mode="max"
-    )
-
-    # Save the best 3 models, and monitor PR AUC
-    best_checkpoint_callback = ModelCheckpoint(
-        dirpath=dirpath,
-        filename="best-{epoch:02d}-{val_pr_auc:.4f}",
-        save_top_k=3,
-        monitor="val_pr_auc",
-        mode="max",
-        save_last=False,
-        verbose=True
-    )
-
-    # Ensure the last model is being saved correctly
-    last_checkpoint_callback = ModelCheckpoint(
-        dirpath=dirpath,
-        filename="last-{epoch:02d}",
-        save_top_k=1,
-        save_last=True,
-        verbose=True
-    )
+    # Callbacks
+    callbacks = [
+        # Early stopping to monitor PR AUC
+        EarlyStopping(
+            monitor="val_pr_auc", 
+            patience=args.patience, 
+            verbose=True, 
+            mode="max"
+        ),
+        
+        # Save the best 3 models
+        ModelCheckpoint(
+            dirpath=dirpath,
+            filename="best-{epoch:02d}-{val_pr_auc:.4f}",
+            save_top_k=3,
+            monitor="val_pr_auc",
+            mode="max",
+            save_last=False,
+            verbose=True
+        ),
+        
+        # Save the last model
+        ModelCheckpoint(
+            dirpath=dirpath,
+            filename="last-{epoch:02d}",
+            save_top_k=1,
+            save_last=True,
+            verbose=True
+        )
+    ]
+    
+    # Add projection layer callback if using channel projection
+    if hasattr(model, 'channel_projection') and args.n_projected_channels < n_channels:
+        projection_callback = ProjectionLayerCallback(
+            freeze_after_epochs=args.freeze_projection_after,
+            freeze_on_plateau=args.freeze_projection_on_plateau,
+            patience=3
+        )
+        callbacks.append(projection_callback)
+        logger.info(f"Added projection layer callback: freeze after {args.freeze_projection_after} epochs or on plateau: {args.freeze_projection_on_plateau}")
 
     trainer = pl.Trainer(
         devices=[int(str_id) for str_id in args.gpus if str_id.isdigit()],
@@ -427,7 +514,7 @@ def supervised(args):
         enable_checkpointing=True,
         logger=tensorboard_logger,
         max_epochs=args.epochs,
-        callbacks=[early_stop_callback, best_checkpoint_callback, last_checkpoint_callback],
+        callbacks=callbacks,
         log_every_n_steps=1,
     )
 
@@ -438,21 +525,15 @@ def supervised(args):
     )
     logger.info("Training completed")
 
-    # Test with pretrained model
-    if args.pretrain_model_path:
-        path = args.pretrain_model_path
-        logger.info(f"Testing pretrained model: {path}")
-        result = trainer.test(model=lightning_model, ckpt_path=path, dataloaders=test_loader)[0]
-        logger.info(f"Pretrained model test results:")
-        logger.info(f"{result}")
-
-    # Test with the best models
+    # Test best models
     logger.info("Testing with best models...")
+    best_checkpoint_callback = [cb for cb in callbacks if isinstance(cb, ModelCheckpoint) and cb.monitor == "val_pr_auc"][0]
+    
     if hasattr(best_checkpoint_callback, 'best_k_models') and best_checkpoint_callback.best_k_models:
-        # Sort models by score (higher PR AUC is better)
+        # Sort models by score
         sorted_models = sorted(
             [(score, path) for path, score in best_checkpoint_callback.best_k_models.items()],
-            reverse=True  # Higher score is better since we're using max mode
+            reverse=True
         )
 
         logger.info(f"Found {len(sorted_models)} best models")
@@ -477,7 +558,7 @@ def supervised(args):
         logger.info("Last model test results:")
         logger.info(f"{last_result}")
     else:
-        # Fallback - look for the filename pattern if the default path doesn't exist
+        # Fallback - look for the filename pattern
         last_checkpoints = [f for f in os.listdir(dirpath) if f.startswith("last-epoch=")]
         if last_checkpoints:
             last_model_path = os.path.join(dirpath, last_checkpoints[0])
@@ -547,14 +628,24 @@ if __name__ == "__main__":
     # Model parameters
     parser.add_argument("--model", type=str, default="BIOT", choices=["BIOT",],
                         help="which supervised model to use")
-    parser.add_argument("--in_channels", type=int, default=16, help="number of input channels")
     parser.add_argument("--sampling_rate", type=int, default=200, help="sampling rate (r)")
-    parser.add_argument("--token_size", type=int, default=200, help="token size (t)")
-    parser.add_argument("--hop_length", type=int, default=100, help="token hop length (t - p)")
+    parser.add_argument("--token_size", type=int, default=200, help="token size (t) in samples")
+    parser.add_argument("--overlap", type=float, default=0.0, help="overlap percentage of tokens")
     parser.add_argument("--raw", type=bool, default=False, help="Whether to use raw data/time series or stft")
-    parser.add_argument("--patch_size", type=int, default=100, help="Size of a patch/ time segment in case raw data is used")
-    parser.add_argument("--overlap", type=float, default=0.0, help="overlap percentage for patches in case raw data is used")
     parser.add_argument("--pretrain_model_path", type=str, default="", help="pretrained model path")
+
+    # Channel projection parameters
+    parser.add_argument("--n_projected_channels", type=int, default=64, 
+                        help="Number of channels after projection (default: 64)")
+    parser.add_argument("--projection_strategy", type=str, default="learned", 
+                        choices=["learned"],
+                        help="Strategy for channel projection (default: learned)")
+    parser.add_argument("--freeze_projection", action="store_true", 
+                        help="Whether to freeze projection layer initially")
+    parser.add_argument("--freeze_projection_after", type=int, default=10, 
+                        help="Freeze projection layer after this many epochs (default: 10)")
+    parser.add_argument("--freeze_projection_on_plateau", action="store_true", 
+                        help="Freeze projection when validation metric plateaus")
     
     arguments = parser.parse_args()
     

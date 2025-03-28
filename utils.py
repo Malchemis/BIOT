@@ -61,7 +61,7 @@ class MEGDataset(torch.utils.data.Dataset):
             file_path = Path(self.root, filename)
             try:
                 # Use torch.load with map_location='cpu' for better compatibility
-                sample = torch.load(file_path, map_location='cpu')
+                sample = torch.load(file_path, map_location='cpu', weights_only=False)
                 # Extract only metadata (exclude large tensors)
                 meta = {k: v for k, v in sample.items() if k != 'data'}
                 self.metadata[idx] = meta
@@ -79,8 +79,7 @@ class MEGDataset(torch.utils.data.Dataset):
         """
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor],
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def __getitem__(self, idx: int) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Get a sample from the dataset."""
         # Check cache first
         if idx in self.cache:
@@ -89,7 +88,7 @@ class MEGDataset(torch.utils.data.Dataset):
             # Load MEG data
             file_path = Path(self.root, self.files[idx])
             try:
-                sample = torch.load(file_path, map_location='cpu')
+                sample = torch.load(file_path, map_location='cpu', weights_only=False)
 
                 # Check if required keys exist
                 if 'data' not in sample or 'label' not in sample:
@@ -112,9 +111,7 @@ class MEGDataset(torch.utils.data.Dataset):
         if not torch.is_tensor(label):
             label = torch.tensor(label, dtype=torch.long)
 
-        # always return (data, labels) tuple as (n_channels, n_segments * n_samples_per_clip), (chunk_size)
-        data = data.permute(1, 0, 2)
-        data = data.reshape(data.shape[0], -1)
+        # always return (data, labels) tuple as (n_segments, n_channels, n_samples_per_segment), (n_segments)
         return data, label
 
     def _update_cache(self, idx: int, sample: Dict[str, torch.Tensor]) -> None:
@@ -149,7 +146,7 @@ class MEGDataset(torch.utils.data.Dataset):
         for idx in range(len(self)):
             file_path = Path(self.root, self.files[idx])
             try:
-                sample = torch.load(file_path, map_location='cpu')
+                sample = torch.load(file_path, map_location='cpu', weights_only=False)
                 if 'patient_id' in sample:
                     patient_ids.add(sample['patient_id'])
             except (FileNotFoundError, RuntimeError) as e:
@@ -174,20 +171,20 @@ class MEGDataset(torch.utils.data.Dataset):
         # Process in batches for better efficiency
         distribution = defaultdict(int)
         batch_size = 100
-        
+
         for batch_start in range(0, len(self), batch_size):
             batch_end = min(batch_start + batch_size, len(self))
-            
+
             for idx in range(batch_start, batch_end):
                 file_path = Path(self.root, self.files[idx])
                 try:
                     # Just load the label instead of the full sample
-                    sample = torch.load(file_path, map_location='cpu')
+                    sample = torch.load(file_path, map_location='cpu', weights_only=False)
                     label = sample['label'].item()
                     distribution[label] += 1
                 except Exception as e:
                     self.custom_logger.warning(f"Error loading {file_path}: {e}")
-                    
+
         return dict(distribution)
 
     def get_samples_by_patient(self, patient_id: str) -> List[int]:
@@ -208,7 +205,7 @@ class MEGDataset(torch.utils.data.Dataset):
         for idx in range(len(self)):
             file_path = Path(self.root, self.files[idx])
             try:
-                sample = torch.load(file_path, map_location='cpu')
+                sample = torch.load(file_path, map_location='cpu', weights_only=False)
                 if sample.get('patient_id') == patient_id:
                     indices.append(idx)
             except (FileNotFoundError, RuntimeError) as e:
@@ -233,7 +230,7 @@ class MEGDataset(torch.utils.data.Dataset):
         for file_path in tqdm(files_list, desc="Calculating class weights"):
             full_path = os.path.join(root_dir, file_path)
             try:
-                sample = torch.load(full_path, map_location='cpu')
+                sample = torch.load(full_path, map_location='cpu', weights_only=False)
                 label = sample['label'].item()
                 class_counts[label] += 1
             except Exception as e:
@@ -1133,9 +1130,8 @@ def focal_loss(y_hat: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma:
     return loss.mean()
 
 
-def focal_loss_with_class_weights(y_hat: torch.Tensor, y: torch.Tensor, 
-                                 class_weights: Dict[int, float],
-                                 gamma: float = 2.0) -> torch.Tensor:
+def focal_loss_with_class_weights(y_hat: torch.Tensor, y: torch.Tensor, class_weights: Dict[int, float],
+                                  gamma: float = 2.0) -> torch.Tensor:
     """Enhanced focal loss that uses class-specific weights.
     
     Args:

@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn import MultiheadAttention
+from torch.nn import Identity
 import numpy as np
 from linear_attention_transformer import LinearAttentionTransformer
 
@@ -168,13 +168,13 @@ class PositionalEncoding(nn.Module):
         pe (torch.Tensor): Precomputed positional encoding. (registered as to not be a model parameter)
     """
     
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 800, log_dir: Optional[str] = None):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 100, log_dir: Optional[str] = None):
         """Initialize the positional encoding.
         
         Args:
             d_model: Dimensionality of the model.
             dropout: Dropout rate.
-            max_len: Maximum sequence length.
+            max_len: sequence length.
             log_dir: Optional directory for log files. If None, logs to console only.
         """
         super(PositionalEncoding, self).__init__()
@@ -211,6 +211,27 @@ class PositionalEncoding(nn.Module):
         """
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
+    
+
+def stft(sample: torch.Tensor, n_fft, hop_length) -> torch.Tensor:
+        """Compute the Short-Time Fourier Transform.
+        
+        Args:
+            sample: Input tensor of shape (batch_size, 1, ts).
+            
+        Returns:
+            Magnitude of the STFT of shape (batch_size, freq, time).
+        """
+        spectral = torch.stft(
+            input=sample.squeeze(1),  # from shape (batch_size, 1, ts) to (batch_size, ts)
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=torch.ones(n_fft, device=sample.device),
+            center=False,
+            onesided=True,
+            return_complex=True,
+        )
+        return torch.abs(spectral)
 
 
 class BIOTEncoder(nn.Module):
@@ -237,11 +258,9 @@ class BIOTEncoder(nn.Module):
             heads: int = 8,
             depth: int = 4,
             n_channels: int = 16,
-            n_fft: int = 200,
-            hop_length: int = 100,
-            raw: bool = False,      # Parameter to toggle between spectral and raw data
-            patch_size: int = 100,  # Patch size for raw data mode
-            overlap: float = 0.0,   # Overlap between patches for raw data mode
+            token_size: int = 200,
+            overlap: float = 0.0,
+            raw: bool = False,       
             log_dir: Optional[str] = None,
             **kwargs
     ):
@@ -252,10 +271,8 @@ class BIOTEncoder(nn.Module):
             heads: Number of attention heads.
             depth: Number of transformer layers.
             n_channels: Number of input channels.
-            n_fft: Number of FFT points.
-            hop_length: Hop length for STFT.
+            token_size: Number of FFT points for Spectral mode / Number of samples for Raw mode.
             raw: Whether to use raw time-domain processing.
-            patch_size: Patch size for raw data mode.
             overlap: Overlap between patches for raw data mode.
             log_dir: Optional directory for log files. If None, logs to console only.
             **kwargs: Additional keyword arguments.
@@ -269,16 +286,13 @@ class BIOTEncoder(nn.Module):
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(file_handler)
 
-        self.n_fft = n_fft
-        self.hop_length = hop_length
+        self.n_fft = token_size
+        self.hop_length = int(token_size * overlap)
         self.raw = raw  # Store the raw mode flag
         
         self.logger.info(f"Initialized with emb_size={emb_size}, heads={heads}, depth={depth}, "
-                         f"n_channels={n_channels}, n_fft={n_fft}, hop_length={hop_length}")
+                         f"n_channels={n_channels}, token_size={token_size}, overlap={overlap}")
         self.logger.info(f"Processing mode: {'Raw time-domain' if raw else 'Spectral'}")
-        
-        if raw:
-            self.logger.info(f"Raw mode parameters: patch_size={patch_size}, overlap={overlap}")
 
         # Create embedding modules for both spectral and raw data processing
         self.patch_frequency_embedding = PatchFrequencyEmbedding(
@@ -287,7 +301,7 @@ class BIOTEncoder(nn.Module):
 
         # Add the patch time embedding for raw data
         self.patch_time_embedding = PatchTimeEmbedding(
-            emb_size=emb_size, patch_size=patch_size, overlap=overlap, log_dir=log_dir
+            emb_size=emb_size, patch_size=token_size, overlap=overlap, log_dir=log_dir
         )
 
         self.transformer = LinearAttentionTransformer(
@@ -305,26 +319,6 @@ class BIOTEncoder(nn.Module):
         self.index = nn.Parameter(
             torch.LongTensor(range(n_channels)), requires_grad=False
         )
-
-    def stft(self, sample: torch.Tensor) -> torch.Tensor:
-        """Compute the Short-Time Fourier Transform.
-        
-        Args:
-            sample: Input tensor of shape (batch_size, 1, ts).
-            
-        Returns:
-            Magnitude of the STFT of shape (batch_size, freq, time).
-        """
-        spectral = torch.stft(
-            input=sample.squeeze(1),  # from shape (batch_size, 1, ts) to (batch_size, ts)
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            window=torch.ones(self.n_fft, device=sample.device),
-            center=False,
-            onesided=True,
-            return_complex=True,
-        )
-        return torch.abs(spectral)
 
     def forward(self, x: torch.Tensor, n_channel_offset: int = 0, perturb: bool = False) -> torch.Tensor:
         """Forward pass of the BIOT encoder.
@@ -349,7 +343,7 @@ class BIOTEncoder(nn.Module):
                 channel_emb = self.patch_time_embedding(channel_data)
             else:
                 # Spectral data processing
-                channel_spec = self.stft(channel_data) # shape: batch, freq, ts
+                channel_spec = stft(channel_data, n_fft=self.n_fft, hop_length=self.hop_length) # shape: batch, freq, ts
                 channel_emb = self.patch_frequency_embedding(channel_spec)
 
             batch_size, ts, _ = channel_emb.shape
@@ -436,17 +430,303 @@ class BIOTClassifier(nn.Module):
         return x
 
 
-class MultiSegmentBIOTEncoder(nn.Module):
-    """Enhanced BIOT Encoder for processing multiple segments simultaneously.
+class ChannelProjection(nn.Module):
+    """Channel projection module to reduce dimensionality of MEG channels.
     
-    This encoder processes chunks of MEG data by treating them as one long sequence
-    with segment tokens to mark boundaries between segments. It preserves the
-    channel token mechanism while adding contextual information across segments.
+    This module implements different channel projection strategies:
+    1. Learned: Full learnable projection using a linear layer
     
     Attributes:
-        base_encoder (BIOTEncoder): The underlying BIOT encoder
-        segment_tokens (nn.Embedding): Embedding for segment tokens
-        segment_indices (nn.Parameter): Parameter for segment indices
+        projection: The projection layer (linear transformation)
+        strategy: Which projection strategy is being used
+        frozen: Whether the projection is frozen or trainable
+    """
+    
+    def __init__(self, n_channels, n_projected_channels, strategy='learned', 
+                 data_samples=None, freeze=False, log_dir=None):
+        """Initialize the channel projection module.
+        
+        Args:
+            n_channels: Original number of channels
+            n_projected_channels: Target number of channels after projection
+            strategy: Projection strategy ('learned', 'pca', 'selection')
+            data_samples: Representative data samples for PCA initialization
+            freeze: Whether to freeze the projection layer
+            log_dir: Directory for logging
+        """
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_projected_channels = n_projected_channels
+        self.strategy = strategy
+        self.logger = logging.getLogger(__name__ + ".ChannelProjection")
+        
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(os.path.join(log_dir, "channel_projection.log"))
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(file_handler)
+            
+        # Initialize projection based on strategy
+        if strategy == 'learned':
+            # Fully learnable projection
+            self.projection = nn.Linear(n_channels, n_projected_channels, bias=False)
+            nn.init.orthogonal_(self.projection.weight)
+            self.logger.info(f"Initialized learnable projection: {n_channels} -> {n_projected_channels}")
+        else:
+            raise ValueError(f"Unknown projection strategy: {strategy}")
+            
+        # Freeze if requested
+        self.frozen = freeze
+        if freeze:
+            for param in self.projection.parameters():
+                param.requires_grad = False
+            self.logger.info("Projection layer frozen (not trainable)")
+    
+    def forward(self, x):
+        """Apply channel projection.
+        
+        Args:
+            x: Input tensor of shape (..., n_channels, ...)
+            
+        Returns:
+            Projected tensor with reduced channel dimension
+        """        
+        # Get original shape and number of dimensions
+        orig_shape = x.shape
+        ndim = len(orig_shape)
+        
+        # For batched data with segments
+        if ndim == 4:  # (batch_size, n_segments, n_channels, n_samples)
+            # Reshape to bring channels to last dimension for linear projection
+            batch_size, n_segments, _, n_samples = orig_shape
+            x_reshaped = x.permute(0, 1, 3, 2).reshape(-1, self.n_channels)
+            
+            # Apply projection
+            x_projected = self.projection(x_reshaped)
+            
+            # Reshape back to original format with reduced channels
+            x_out = x_projected.reshape(batch_size, n_segments, n_samples, self.n_projected_channels)
+            x_out = x_out.permute(0, 1, 3, 2)
+            
+        # For batched data without segments (only individual clips)
+        elif ndim == 3:  # (batch_size, n_channels, n_samples)
+            # Reshape to bring channels to last dimension
+            batch_size, _, n_samples = orig_shape
+            x_reshaped = x.permute(0, 2, 1).reshape(-1, self.n_channels)
+            
+            # Apply projection
+            x_projected = self.projection(x_reshaped)
+            
+            # Reshape back
+            x_out = x_projected.reshape(batch_size, n_samples, self.n_projected_channels)
+            x_out = x_out.permute(0, 2, 1)
+            
+        else:
+            raise ValueError(f"Unsupported input tensor shape: {orig_shape}")
+            
+        return x_out
+    
+    def freeze(self):
+        """Freeze the projection layer."""
+        for param in self.projection.parameters():
+            param.requires_grad = False
+        self.frozen = True
+        self.logger.info("Projection layer frozen")
+    
+    def unfreeze(self):
+        """Unfreeze the projection layer."""
+        for param in self.projection.parameters():
+            param.requires_grad = True
+        self.frozen = False
+        self.logger.info("Projection layer unfrozen")
+
+
+class BIOTHierarchicalEncoder(nn.Module):
+    """BIOT Hierarchical Encoder with Channel Projection.
+
+    This encoder processes chunks of biomedical signals using a hierarchical attention approach:
+    1. Intra-segment attention with a CLS token to obtain a summary of each segment
+    2. Inter-segment attention on the segment summaries for context across segments
+    
+    This architecture is designed specifically for MEG data with many channels (275+)
+    and enables processing segments with temporal context for improved generalization.
+
+    We add a channel projection layer to reduce the number of channels before processing.
+    
+    Attributes:
+        segment_encoder: Modified BIOT encoder for processing individual segments
+        segment_positional_encoding: Positional encoding for segment positions
+        inter_segment_transformer: Transformer for processing segment representations
+        classifier: Classification head for final prediction
+    """
+    
+    def __init__(
+            self,
+            emb_size: int = 256,
+            heads: int = 8,
+            segment_encoder_depth: int = 4,
+            inter_segment_depth: int = 2,
+            n_channels: int = 275,
+            n_projected_channels: int = 64,  # New parameter for projected channels
+            token_size: int = 200,
+            overlap: float = 0.0,
+            raw: bool = False,
+            n_segments: int = 100,
+            n_classes: int = 2,
+            projection_strategy: str = 'learned',  # Projection strategy
+            freeze_projection: bool = False,  # Whether to initially freeze projection
+            log_dir: Optional[str] = None,
+            **kwargs
+    ):
+        """Initialize the BIOT hierarchical encoder with channel projection.
+        
+        Args:
+            emb_size: Size of the embedding vectors.
+            heads: Number of attention heads.
+            segment_encoder_depth: Number of transformer layers for intra-segment attention.
+            inter_segment_depth: Number of transformer layers for inter-segment attention.
+            n_channels: Number of input channels (275 for MEG).
+            n_projected_channels: Number of channels after projection.
+            token_size: Number of FFT points for Spectral mode / Number of samples for Raw mode.
+            overlap: Overlap between patches for raw data mode.
+            raw: Whether to use raw time-domain processing.
+            n_segments: number of segments in a chunk.
+            n_classes: Number of output classes.
+            projection_strategy: Strategy for channel projection ('learned', only that choice for now but we could extend later).
+            freeze_projection: Whether to freeze the projection layer initially.
+            log_dir: Optional directory for log files. If None, logs to console only.
+            **kwargs: Additional keyword arguments.
+        """
+        super().__init__()
+        self.logger = logging.getLogger(__name__ + ".BIOTHierarchicalEncoderWithProjection")
+        
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(os.path.join(log_dir, "biot_hierarchical_encoder_with_projection.log"))
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(file_handler)
+
+        self.logger.info(f"Initialized hierarchical encoder with channel projection")
+        self.logger.info(f"Channel projection: {n_channels} -> {n_projected_channels} using {projection_strategy} strategy")
+        
+        # Channel projection layer (to be initialized with data later)
+        if n_projected_channels < n_channels:
+            self.channel_projection = ChannelProjection(
+                n_channels=n_channels,
+                n_projected_channels=n_projected_channels,
+                strategy=projection_strategy,
+                freeze=freeze_projection,
+                log_dir=log_dir
+            )
+        else:
+            self.channel_projection = Identity()
+            self.logger.info("No channel projection needed (n_projected_channels >= n_channels)")
+        
+        # Save channel dimensions
+        self.n_channels = n_channels
+        self.n_projected_channels = n_projected_channels
+        
+        # Modified BIOT encoder for segment-level processing with CLS token
+        # Now works with projected channels
+        self.segment_encoder = ModifiedBIOTEncoder(
+            emb_size=emb_size,
+            heads=heads,
+            depth=segment_encoder_depth,
+            n_channels=n_projected_channels,  # Use projected channel count
+            token_size=token_size,
+            overlap=overlap,
+            raw=raw,
+            log_dir=log_dir
+        )
+        
+        # Segment positional encoding for inter-segment attention
+        self.segment_positional_encoding = PositionalEncoding(
+            d_model=emb_size,
+            max_len=n_segments,
+            log_dir=log_dir
+        )
+        
+        # Inter-segment transformer
+        self.inter_segment_transformer = LinearAttentionTransformer(
+            dim=emb_size,
+            heads=heads,
+            depth=inter_segment_depth,
+            max_seq_len=n_segments,
+            attn_layer_dropout=0.2,
+            attn_dropout=0.2,
+        )
+        
+        # Classification head
+        self.classifier = ClassificationHead(
+            emb_size=emb_size,
+            n_classes=n_classes,
+            log_dir=log_dir
+        )
+    
+    def freeze_projection(self):
+        """Freeze the channel projection layer."""
+        self.channel_projection.freeze()
+    
+    def unfreeze_projection(self):
+        """Unfreeze the channel projection layer."""
+        self.channel_projection.unfreeze()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the BIOT hierarchical encoder with channel projection.
+        
+        Args:
+            x: Input tensor of shape (batch_size, n_segments, n_channels, n_samples_per_segment).
+            
+        Returns:
+            Classification logits for each segment of shape (batch_size, n_segments, n_classes).
+        """
+        batch_size, n_segments, n_channels, n_samples = x.shape
+        
+        # Apply channel projection
+        x_projected = self.channel_projection(x)
+        
+        # Process each segment individually to get segment embeddings
+        segment_embeddings = []
+        
+        for i in range(n_segments):
+            # Extract the current segment with projected channels
+            segment = x_projected[:, i, :, :]  # (batch_size, n_projected_channels, n_samples)
+            
+            # Get the segment representation using the modified BIOT encoder with CLS token
+            segment_emb = self.segment_encoder(segment)  # (batch_size, emb_size)
+            segment_embeddings.append(segment_emb.unsqueeze(1))  # (batch_size, 1, emb_size)
+        
+        # Concatenate segment embeddings
+        segment_embeddings = torch.cat(segment_embeddings, dim=1)  # (batch_size, n_segments, emb_size)
+        
+        # Add segment positional encodings for temporal context
+        segment_embeddings = self.segment_positional_encoding(segment_embeddings)
+        
+        # Process with inter-segment transformer to get contextualized segment representations
+        output_embeddings = self.inter_segment_transformer(segment_embeddings)  # (batch_size, n_segments, emb_size)
+        
+        # Apply classification head to each segment embedding
+        # reshape to (batch_size * n_segments, emb_size)
+        output_embeddings = output_embeddings.view(-1, output_embeddings.size(-1))
+        logits = self.classifier(output_embeddings)  # (batch_size * n_segments, n_classes)
+        # reshape back to (batch_size, n_segments, n_classes)
+        logits = logits.view(batch_size, n_segments, -1)
+        return logits
+
+
+class ModifiedBIOTEncoder(nn.Module):
+    """Modified BIOT Encoder with CLS token for intra-segment attention.
+    
+    This is a modification of the original BIOT encoder to include a CLS token
+    that aggregates information from all channels and temporal patches.
+    
+    Attributes:
+        patch_frequency_embedding: Embedding module for spectral data
+        patch_time_embedding: Embedding module for raw time data
+        cls_token: Learnable CLS token added to each segment
+        transformer: Transformer model for intra-segment attention
+        positional_encoding: Positional encoding module
+        channel_tokens: Embedding for channel tokens
     """
     
     def __init__(
@@ -455,283 +735,137 @@ class MultiSegmentBIOTEncoder(nn.Module):
             heads: int = 8,
             depth: int = 4,
             n_channels: int = 275,
-            n_projected_channels: int = 64,
-            max_segments: int = 300,  # Maximum number of segments in a chunk
-            n_fft: int = 200,
-            hop_length: int = 100,
-            raw: bool = False,
-            patch_size: int = 100,
+            token_size: int = 200,
             overlap: float = 0.0,
+            raw: bool = False,
             log_dir: Optional[str] = None,
             **kwargs
     ):
-        """Initialize the multi-segment BIOT encoder.
+        """Initialize the modified BIOT encoder.
         
         Args:
-            emb_size: Size of the embedding vectors
-            heads: Number of attention heads
-            depth: Number of transformer layers
-            n_channels: Number of input channels
-            max_segments: Maximum number of segments per chunk
-            n_fft: Number of FFT points
-            hop_length: Hop length for STFT
-            raw: Whether to use raw time-domain processing
-            patch_size: Patch size for raw data mode
-            overlap: Overlap between patches for raw data mode
-            log_dir: Optional directory for log files
-            **kwargs: Additional keyword arguments
+            emb_size: Size of the embedding vectors.
+            heads: Number of attention heads.
+            depth: Number of transformer layers.
+            n_channels: Number of input channels.
+            token_size: Number of FFT points for Spectral mode / Number of samples for Raw mode.
+            overlap: Overlap between patches for raw data mode.
+            raw: Whether to use raw time-domain processing.
+            log_dir: Optional directory for log files. If None, logs to console only.
+            **kwargs: Additional keyword arguments.
         """
         super().__init__()
-        self.logger = logging.getLogger(__name__ + ".MultiSegmentBIOTEncoder")
+        self.logger = logging.getLogger(__name__ + ".ModifiedBIOTEncoder")
         
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "multi_segment_biot_encoder.log"))
+            file_handler = logging.FileHandler(os.path.join(log_dir, "modified_biot_encoder.log"))
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(file_handler)
 
-        # Reduction spatial dimension to n_projected_channels
-        self.channel_reduction = nn.Conv1d(
-            in_channels=n_channels,
-            out_channels=n_projected_channels,
-            kernel_size=1,
-            stride=1,
-        ) # linear combination across channels
-        
-        # Create the base BIOT encoder
-        self.base_encoder = BIOTEncoder(
-            emb_size=emb_size,
-            heads=heads,
-            depth=depth,
-            n_channels=n_projected_channels, # Reduced channels
-            n_fft=n_fft,
-            hop_length=hop_length,
-            raw=raw,
-            patch_size=patch_size,
-            overlap=overlap,
-            log_dir=log_dir,
-            **kwargs
-        )
-        
-        # Add segment tokens embeddings
-        self.segment_tokens = nn.Embedding(max_segments, emb_size)
-        self.segment_indices = nn.Parameter(
-            torch.arange(max_segments), requires_grad=False
-        )
-
-        self.segment_attention = MultiheadAttention(emb_size, heads)
-        self.segment_layer_norm = nn.LayerNorm(emb_size)
-
-        
-        # Save parameters
+        self.n_fft = token_size
+        self.hop_length = int(token_size * overlap)
         self.raw = raw
-        self.n_channels = n_channels
-        self.projected_channels = n_projected_channels
-        self.max_segments = max_segments
-        self.emb_size = emb_size
-        self.segment_length = None  # Will be determined during first forward pass
         
-        self.logger.info(f"Initialized with max_segments={max_segments}, n_channels={n_channels}")
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the multi-segment BIOT encoder.
-        
-        Args:
-            x: Input tensor of shape (batch_size, n_channels, total_time)
-                where total_time = n_segments * segment_length
-            
-        Returns:
-            Segment embeddings of shape (batch_size, n_segments, emb_size)
-        """
-        batch_size, n_channels, total_time = x.shape
-        
-        # Calculate exact segment length
-        self.segment_length = total_time // self.max_segments
-        actual_segments = min(total_time // self.segment_length, self.max_segments)
-        actual_segments = torch.tensor(actual_segments, device=x.device, dtype=torch.long)
-        
-        # Channel projection
-        projected = self.channel_reduction(x)  # [B, C_proj, T]
-        
-        # Reshape to segments [B, C_proj, S, L]
-        segments = projected.view(
-            batch_size, 
-            self.projected_channels,
-            actual_segments,
-            self.segment_length
-        )
-        
-        segment_embeddings = []
-        for seg_idx in range(actual_segments):
-            seg_data = segments[:, :, seg_idx, :]  # [B, C_proj, L]
-            
-            if self.raw:
-                # Process each projected channel individually for raw data
-                channel_embs = []
-                for chan_idx in range(self.projected_channels):
-                    chan_data = seg_data[:, chan_idx:chan_idx+1, :]  # [B, 1, L]
-                    
-                    # Process through patch_time_embedding
-                    chan_emb = self.base_encoder.patch_time_embedding(chan_data)
-                    
-                    # Add channel token
-                    chan_token = self.base_encoder.channel_tokens(
-                        self.base_encoder.index[chan_idx].long()
-                    ).view(1, 1, -1)
-                    chan_emb += chan_token
-                    
-                    channel_embs.append(chan_emb)
-                
-                # Combine channel embeddings
-                emb = torch.stack(channel_embs, dim=1).mean(dim=1)  # [B, T, E]
-            else:
-                # Process each projected channel individually for spectral processing
-                channel_embs = []
-                for chan_idx in range(self.projected_channels):
-                    # Extract single channel data [B, 1, L]
-                    chan_data = seg_data[:, chan_idx:chan_idx+1, :]
-                    
-                    # STFT processing
-                    spec = self.base_encoder.stft(chan_data)  # [B, Freq, Time]
-                    chan_emb = self.base_encoder.patch_frequency_embedding(spec)
-                    
-                    # Add channel embedding
-                    chan_token = self.base_encoder.channel_tokens(
-                        self.base_encoder.index[chan_idx].long() # ensure long type
-                    ).unsqueeze(0).unsqueeze(0)  # [1, 1, E]
-                    chan_emb += chan_token
-                    
-                    channel_embs.append(chan_emb)
-                
-                # Combine channel embeddings
-                emb = torch.stack(channel_embs, dim=1).mean(dim=1)  # [B, T, E]
-            
-            # Add segment embedding and positional encoding
-            seg_idx_tensor = torch.tensor([seg_idx], device=x.device, dtype=torch.long)
-            emb += self.segment_tokens(seg_idx_tensor).view(1, 1, -1)  # from [1, E] to [1, 1, E] for broadcasting
-            emb = self.base_encoder.positional_encoding(emb)
-            
-            # Transformer processing
-            transformed = self.base_encoder.transformer(emb)
-            segment_embeddings.append(transformed.mean(dim=1))  # [B, E]
+        self.logger.info(f"Modified BIOT encoder initialized")
+        self.logger.info(f"Processing mode: {'Raw time-domain' if raw else 'Spectral'}")
 
-        # Rest of the code remains the same
-        all_segments = torch.stack(segment_embeddings, dim=1)
-        attn_output, _ = self.segment_attention(all_segments, all_segments, all_segments)
-        return self.segment_layer_norm(all_segments + attn_output)
-        
-
-class AttClassificationHead(nn.Module):
-    def __init__(self, emb_size, n_classes):
-        super().__init__()
-        self.attention_pool = nn.MultiheadAttention(emb_size, 1)
-        self.fc = nn.Sequential(
-            nn.LayerNorm(emb_size),
-            nn.Linear(emb_size, n_classes)
+        # Create embedding modules for both spectral and raw data processing
+        self.patch_frequency_embedding = PatchFrequencyEmbedding(
+            emb_size=emb_size, n_freq=self.n_fft // 2 + 1, log_dir=log_dir
         )
 
-    def forward(self, x):
-        # x shape: [B, S, E]
-        x = x.permute(1, 0, 2)  # [S, B, E] for MHA
-        attn_output, _ = self.attention_pool(x, x, x)
-        attn_output = attn_output.permute(1, 0, 2)  # [B, S, E]
-        return self.fc(attn_output)  # [B, S, n_classes]
+        # Add the patch time embedding for raw data
+        self.patch_time_embedding = PatchTimeEmbedding(
+            emb_size=emb_size, patch_size=token_size, overlap=overlap, log_dir=log_dir
+        )
 
+        # CLS token for aggregating segment information
+        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size))
 
-class MultiSegmentBIOTClassifier(nn.Module):
-    """BIOT Classifier for multi-segment classification.
-    
-    This classifier processes chunks of MEG data and outputs a classification
-    score for each segment in the chunk, leveraging contextual information
-    across segments.
-    
-    Attributes:
-        encoder (MultiSegmentBIOTEncoder): The encoder for multi-segment processing
-        classifier (ClassificationHead): Classification head for segment-level predictions
-    """
-    
-    def __init__(
-            self,
-            n_classes: int = 1,
-            n_channels: int = 16,
-            max_segments: int = 16,
-            n_fft: int = 200,
-            hop_length: int = 100,
-            raw: bool = False,
-            patch_size: int = 100,
-            overlap: float = 0.0,
-            emb_size: int = 256,
-            heads: int = 8,
-            depth: int = 4,
-            log_dir: Optional[str] = None,
-            **kwargs
-    ):
-        """Initialize the multi-segment BIOT classifier.
-        
-        Args:
-            n_classes: Number of output classes (1 for binary classification)
-            n_channels: Number of input channels
-            max_segments: Maximum number of segments per chunk
-            n_fft: Number of FFT points
-            hop_length: Hop length for STFT
-            raw: Whether to use raw time-domain processing
-            patch_size: Patch size for raw data mode
-            overlap: Overlap between patches for raw data mode
-            emb_size: Size of the embedding vectors
-            heads: Number of attention heads
-            depth: Number of transformer layers
-            log_dir: Optional directory for log files
-            **kwargs: Additional keyword arguments
-        """
-        super().__init__()
-        self.logger = logging.getLogger(__name__ + ".MultiSegmentBIOTClassifier")
-        
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-            file_handler = logging.FileHandler(os.path.join(log_dir, "multi_segment_biot_classifier.log"))
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(file_handler)
-        
-        # Multi-segment encoder
-        self.encoder = MultiSegmentBIOTEncoder(
-            emb_size=emb_size,
+        # Transformer with increased max_seq_len to accommodate the extra CLS token
+        self.transformer = LinearAttentionTransformer(
+            dim=emb_size,
             heads=heads,
             depth=depth,
-            n_channels=n_channels,
-            max_segments=max_segments,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            raw=raw,
-            patch_size=patch_size,
-            overlap=overlap,
-            log_dir=log_dir,
-            **kwargs
+            max_seq_len=1025,  # 1024 + 1 for CLS token
+            attn_layer_dropout=0.2,
+            attn_dropout=0.2,
         )
-        
-        # Classification head that uses attention pooling
-        self.classifier = AttClassificationHead(
-            emb_size=emb_size,
-            n_classes=n_classes,
+        self.positional_encoding = PositionalEncoding(emb_size, log_dir=log_dir)
+
+        # Channel token embeddings
+        self.channel_tokens = nn.Embedding(n_channels, emb_size)
+        self.index = nn.Parameter(
+            torch.LongTensor(range(n_channels)), requires_grad=False
         )
-        
-        self.logger.info(f"Initialized with n_classes={n_classes}, max_segments={max_segments}")
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the multi-segment BIOT classifier.
+
+    def forward(self, x: torch.Tensor, n_channel_offset: int = 0, perturb: bool = False) -> torch.Tensor:
+        """Forward pass of the modified BIOT encoder.
         
         Args:
-            x: Input tensor of shape (batch_size, n_channels, total_time)
-                where total_time = n_segments * segment_length
+            x: Input tensor of shape (batch_size, channel, ts).
+            n_channel_offset: Offset for channel tokens.
+            perturb: Whether to randomly perturb the sequence.
             
         Returns:
-            Logits of shape (batch_size, n_segments, n_classes)
+            CLS token embedding of shape (batch_size, emb_size).
         """
-        # Get all segment embeddings [B, S, E]
-        segment_embeddings = self.encoder(x)  
+        batch_size = x.shape[0]
+        emb_seq = []
         
-        # Process all segments simultaneously
-        logits = self.classifier(segment_embeddings)  # [B, S, 1]
-        return logits.squeeze(-1)  # [B, S]
+        # Process each channel
+        for i in range(x.shape[1]):
+            # Get the current channel data
+            channel_data = x[:, i:i + 1, :]
+
+            # Process channel data based on mode (raw or spectral)
+            if self.raw:
+                # Raw time-series data processing
+                channel_emb = self.patch_time_embedding(channel_data)
+            else:
+                # Spectral data processing
+                channel_spec = stft(channel_data, n_fft=self.n_fft, hop_length=self.hop_length)
+                channel_emb = self.patch_frequency_embedding(channel_spec)
+
+            batch_size_inner, ts, _ = channel_emb.shape
+
+            # Add channel token embedding
+            channel_token_emb = (
+                self.channel_tokens(
+                    self.index[i + n_channel_offset]
+                )
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(batch_size_inner, ts, 1)
+            )
+
+            # Add positional encoding
+            channel_emb = self.positional_encoding(channel_emb + channel_token_emb)
+
+            # Apply perturbation if specified
+            if perturb:
+                ts = channel_emb.shape[1]
+                ts_new = np.random.randint(ts // 2, ts)
+                selected_ts = np.random.choice(range(ts), ts_new, replace=False)
+                channel_emb = channel_emb[:, selected_ts]
+                
+            emb_seq.append(channel_emb)
+
+        # Concatenate embeddings from all channels
+        emb = torch.cat(emb_seq, dim=1)  # (batch_size, channels*ts, emb_size)
+        
+        # Add CLS token at the beginning
+        cls_tokens = self.cls_token.repeat(batch_size, 1, 1)  # (batch_size, 1, emb_size)
+        emb_with_cls = torch.cat([cls_tokens, emb], dim=1)  # (batch_size, 1 + channels*ts, emb_size)
+        
+        # Process with transformer
+        output = self.transformer(emb_with_cls)  # (batch_size, 1 + channels*ts, emb_size)
+        
+        # Extract CLS token representation for segment summary
+        cls_output = output[:, 0, :]  # (batch_size, emb_size)
+        
+        return cls_output
 
 
 def setup_logging(log_dir: Optional[str] = None, log_level: int = logging.INFO):

@@ -3,4 +3,4 @@
 # from .cnn_transformer import CNNTransformer
 # from .ffcl import FFCL
 # from .st_transformer import STTransformer
-from .biot import MultiSegmentBIOTClassifier #BIOTClassifier, UnsupervisedPretrain, SupervisedPretrain, BIOTEncoder
+from .biot import BIOTHierarchicalEncoder# MultiSegmentBIOTClassifier #BIOTClassifier, UnsupervisedPretrain, SupervisedPretrain, BIOTEncoder
